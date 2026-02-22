@@ -24,6 +24,7 @@ import multiprocessing as mp
 mp.set_start_method("spawn", force=True)
 
 import os, sys, json, shutil, subprocess, tempfile, threading, traceback, time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import numpy as np
@@ -33,12 +34,13 @@ import torch
 # ═══════════════════════════════════════════════════════════════
 #  CONFIG
 # ═══════════════════════════════════════════════════════════════
-VIDEO_PATH    = Path("/media/HDD1/moritz/foundential/Anterior Temporal Lobe Resection Operative Videos/ATLR_20.mp4")
+VIDEO_PATH    = Path("/home/moritz/Foundential Model/own experiments/labeling/test_videos/TL-034_vestibular_schwannoma_resection_11062021_21390469_NK.mp4")
 PORT          = 8765
 SAMPLE_FPS    = 1
 TRACK_SECONDS = 50
 SAM2_HF_ID   = "facebook/sam2-hiera-large"
-EXPORT_DIR    = Path("./tracking_exports")
+PROJECT_ROOT  = Path(__file__).resolve().parents[2]
+EXPORT_DIR    = PROJECT_ROOT / "tracking_exports"
 AUTOSAVE_DIR  = EXPORT_DIR / "autosave" / VIDEO_PATH.stem
 
 INSTRUMENTS = [
@@ -111,7 +113,12 @@ class VideoReader:
         self.total = len(self.sample_map)
         self._lock = threading.Lock()
         self._cap  = cv2.VideoCapture(self.path)
+        self._ffmpeg_bin = shutil.which("ffmpeg")
         print(f"[video] {self.orig_total} orig @ {self.orig_fps:.1f} fps → {self.total} samples (step {self.step})")
+        if self._ffmpeg_bin:
+            print(f"[video] ffmpeg extractor: {self._ffmpeg_bin}")
+        else:
+            print("[video] ffmpeg extractor: not found, using OpenCV fallback")
 
     def get_frame(self, sample_idx):
         if sample_idx < 0 or sample_idx >= self.total: return None
@@ -128,13 +135,73 @@ class VideoReader:
 
     def extract_range_to_dir(self, start_sample, count, out_dir):
         Path(out_dir).mkdir(parents=True, exist_ok=True)
+        if count <= 0 or start_sample >= self.total:
+            return 0
+        start_sample = max(0, int(start_sample))
+        wanted = min(int(count), self.total - start_sample)
+
+        for p in Path(out_dir).glob("*.jpg"):
+            try:
+                p.unlink()
+            except OSError:
+                pass
+
+        if self._ffmpeg_bin:
+            ff_written = self._extract_range_ffmpeg(start_sample, wanted, out_dir)
+            if ff_written >= wanted:
+                return ff_written
+            if ff_written > 0:
+                print(f"[video] ffmpeg partial ({ff_written}/{wanted}); filling remaining with OpenCV")
+            else:
+                print("[video] ffmpeg extraction failed; falling back to OpenCV")
+            cv_written = self._extract_range_opencv(
+                start_sample + ff_written, wanted - ff_written, out_dir, start_idx=ff_written
+            )
+            return ff_written + cv_written
+
+        return self._extract_range_opencv(start_sample, wanted, out_dir, start_idx=0)
+
+    def _extract_range_ffmpeg(self, start_sample, count, out_dir):
+        if count <= 0:
+            return 0
+        start_orig = self.sample_map[start_sample]
+        start_sec = start_orig / max(self.orig_fps, 1e-6)
+        out_pattern = os.path.join(out_dir, "%06d.jpg")
+        cmd = [
+            self._ffmpeg_bin, "-hide_banner", "-loglevel", "error", "-nostdin",
+            "-ss", f"{start_sec:.6f}",
+            "-i", self.path,
+            "-an", "-sn",
+            "-threads", "0",
+            "-frames:v", str(count),
+            "-start_number", "0",
+            "-q:v", "2",
+        ]
+        if self.step > 1:
+            cmd += ["-vf", f"select=not(mod(n\\,{self.step}))", "-vsync", "0"]
+        cmd += [out_pattern]
+        try:
+            proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+            if proc.returncode != 0:
+                err = (proc.stderr or "").strip()
+                print(f"[video] ffmpeg error: {err[:300]}")
+                return 0
+            return sum(1 for _ in Path(out_dir).glob("*.jpg"))
+        except Exception as e:
+            print(f"[video] ffmpeg exception: {e}")
+            return 0
+
+    def _extract_range_opencv(self, start_sample, count, out_dir, start_idx=0):
         written = 0
         for i in range(count):
             si = start_sample + i
-            if si >= self.total: break
+            if si >= self.total:
+                break
             f = self.get_frame(si)
-            if f is None: break
-            cv2.imwrite(os.path.join(out_dir, f"{i:06d}.jpg"), f)
+            if f is None:
+                break
+            out_i = start_idx + i
+            cv2.imwrite(os.path.join(out_dir, f"{out_i:06d}.jpg"), f)
             written += 1
         return written
 
@@ -189,6 +256,11 @@ class SAM2Tracker:
         self.predictor = _load_predictor()
         self.state = TrackerState()
         self._tmp = None
+        self._save_timer = None
+        self._save_lock = threading.Lock()
+        # Parallel post-processing for multi-object tracking frames.
+        self._obj_workers = max(1, min(8, os.cpu_count() or 1))
+        self._obj_pool = ThreadPoolExecutor(max_workers=self._obj_workers, thread_name_prefix="sam2-obj")
 
     @property
     def available(self): return self.predictor is not None
@@ -358,7 +430,9 @@ class SAM2Tracker:
 
             n_total = sum(1 for si in s.bboxes if oid in s.bboxes[si] and s.bboxes[si][oid] is not None)
             print(f"[sam2] Extended obj {oid} → {n_total} total bboxes (end={new_end}) ✓")
-            self._autosave()
+            # Make results visible to frontend immediately; persist in background.
+            s.running = False
+            self._autosave_background()
 
         except Exception as e:
             s.error = f"{type(e).__name__}: {e}"
@@ -371,6 +445,11 @@ class SAM2Tracker:
     def _is_oof(self, si, oid):
         """Check if object is OOF at given frame."""
         return oid in self.state.oof and si >= self.state.oof[oid]
+
+    @staticmethod
+    def _mask_bbox_task(oid, raw_mask, n_blobs):
+        mask = np.squeeze(raw_mask).astype(bool, copy=False)
+        return oid, mask, mask_to_bbox(mask, n_blobs)
 
     # ─── queries ──────────────────────────────────
     def get_frame_data(self, si):
@@ -442,17 +521,36 @@ class SAM2Tracker:
     # ─── export ───────────────────────────────────
     def export_video(self, video, path):
         s = self.state
-        if not s.bboxes: return False
+        print(f"[export] Start video export -> {path}")
+        print(f"[export] State: objects={len(s.objects)} mask_frames={len(s.masks)} bbox_frames={len(s.bboxes)} start={s.start} end={s.end}")
+        if not s.bboxes:
+            print("[export] Aborting: no bbox data in memory (nothing to render).")
+            return False
+        if s.start is None or s.end is None:
+            keys = sorted(s.bboxes.keys())
+            if not keys:
+                print("[export] Aborting: empty bbox map after validation.")
+                return False
+            s.start, s.end = keys[0], keys[-1]
+            print(f"[export] start/end missing -> inferred range [{s.start}, {s.end}]")
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         cmd = ["ffmpeg","-y","-f","rawvideo","-vcodec","rawvideo",
                "-s",f"{video.width}x{video.height}","-pix_fmt","bgr24",
-               "-r","1","-i","-","-c:v","libx264","-pix_fmt","yuv420p",
+               "-r","1","-i","-","-loglevel","error","-c:v","libx264","-pix_fmt","yuv420p",
                "-preset","fast",str(path)]
         proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
-                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        frame_total = max(0, s.end - s.start + 1)
+        frame_seen = 0
+        frame_written = 0
+        frame_missing = 0
+        broken_pipe = False
         for si in range(s.start, s.end + 1):
+            frame_seen += 1
             frame = video.get_frame(si)
-            if frame is None: continue
+            if frame is None:
+                frame_missing += 1
+                continue
             # draw mask overlay
             om = s.masks.get(si, {})
             overlay = frame.copy()
@@ -468,16 +566,36 @@ class SAM2Tracker:
                 if box is None or self._is_oof(si, oid): continue
                 info = s.objects.get(oid, {})
                 label = info.get("label", "?")
+                draw_label = f"#{oid} {label}"
                 r, g, b = INST_COLOR.get(label, (255,255,255))
                 x1,y1,x2,y2 = [int(v) for v in box]
                 cv2.rectangle(frame, (x1,y1),(x2,y2),(b,g,r),3)
-                (tw,th),_ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+                (tw,th),_ = cv2.getTextSize(draw_label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
                 ly = max(y1-8, th+4)
                 cv2.rectangle(frame,(x1,ly-th-4),(x1+tw+8,ly+4),(b,g,r),-1)
-                cv2.putText(frame, label, (x1+4,ly), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
-            proc.stdin.write(frame.tobytes())
-        proc.stdin.close(); proc.wait()
-        return proc.returncode == 0
+                cv2.putText(frame, draw_label, (x1+4,ly), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
+            try:
+                proc.stdin.write(frame.tobytes())
+                frame_written += 1
+            except BrokenPipeError:
+                broken_pipe = True
+                break
+        if proc.stdin:
+            proc.stdin.close()
+        proc.wait()
+        print(f"[export] Frames: target={frame_total} iterated={frame_seen} written={frame_written} missing={frame_missing} broken_pipe={broken_pipe}")
+        if proc.returncode != 0:
+            err_text = ""
+            try:
+                if proc.stderr:
+                    err_text = proc.stderr.read().decode("utf-8", errors="ignore").strip()
+            except Exception:
+                pass
+            print(f"[export] ffmpeg cmd: {' '.join(cmd)}")
+            print(f"[export] ffmpeg failed ({proc.returncode}): {err_text or 'no stderr output'}")
+            return False
+        print("[export] ffmpeg completed successfully.")
+        return True
 
     def export_data(self, path):
         s = self.state
@@ -510,39 +628,42 @@ class SAM2Tracker:
         return True
 
     # ─── autosave / autoload ──────────────────────
-    _save_timer = None
-
     def _autosave_debounced(self):
         if self._save_timer: self._save_timer.cancel()
-        self._save_timer = threading.Timer(1.0, self._autosave)
+        self._save_timer = threading.Timer(1.0, self._autosave_background)
+        self._save_timer.daemon = True
         self._save_timer.start()
 
+    def _autosave_background(self):
+        threading.Thread(target=self._autosave, daemon=True).start()
+
     def _autosave(self):
-        try:
-            s = self.state
-            AUTOSAVE_DIR.mkdir(parents=True, exist_ok=True)
-            bboxes_ser = {}
-            for si, bb in s.bboxes.items():
-                bboxes_ser[str(si)] = {str(oid): box for oid, box in bb.items()}
-            oof_ser = {str(oid): frame_from for oid, frame_from in s.oof.items()}
-            data = {
-                "objects": {str(k): v for k, v in s.objects.items()},
-                "bboxes": bboxes_ser,
-                "oof": oof_ser,
-                "start": s.start, "end": s.end,
-                "current_frame": s.current_frame,
-            }
-            with open(AUTOSAVE_DIR / "state.json", "w") as f:
-                json.dump(data, f)
-            arrays = {}
-            for si, om in s.masks.items():
-                for oid, mask in om.items():
-                    arrays[f"s{si:06d}_o{oid}"] = mask
-            if arrays:
-                np.savez_compressed(AUTOSAVE_DIR / "masks.npz", **arrays)
-            print(f"[autosave] Saved {len(s.objects)} objects, {len(s.bboxes)} frames")
-        except Exception as e:
-            print(f"[autosave] Error: {e}")
+        with self._save_lock:
+            try:
+                s = self.state
+                AUTOSAVE_DIR.mkdir(parents=True, exist_ok=True)
+                bboxes_ser = {}
+                for si, bb in s.bboxes.items():
+                    bboxes_ser[str(si)] = {str(oid): box for oid, box in bb.items()}
+                oof_ser = {str(oid): frame_from for oid, frame_from in s.oof.items()}
+                data = {
+                    "objects": {str(k): v for k, v in s.objects.items()},
+                    "bboxes": bboxes_ser,
+                    "oof": oof_ser,
+                    "start": s.start, "end": s.end,
+                    "current_frame": s.current_frame,
+                }
+                with open(AUTOSAVE_DIR / "state.json", "w") as f:
+                    json.dump(data, f)
+                arrays = {}
+                for si, om in s.masks.items():
+                    for oid, mask in om.items():
+                        arrays[f"s{si:06d}_o{oid}"] = mask
+                if arrays:
+                    np.savez_compressed(AUTOSAVE_DIR / "masks.npz", **arrays)
+                print(f"[autosave] Saved {len(s.objects)} objects, {len(s.bboxes)} frames")
+            except Exception as e:
+                print(f"[autosave] Error: {e}")
 
     def _autoload(self):
         sp = AUTOSAVE_DIR / "state.json"
@@ -631,12 +752,30 @@ class SAM2Tracker:
                     abs_si = sample_idx + rel_idx
                     if abs_si not in s.masks: s.masks[abs_si] = {}
                     if abs_si not in s.bboxes: s.bboxes[abs_si] = {}
-                    for i, oid in enumerate(obj_ids):
-                        oid = int(oid)
-                        m = (masks_t[i] > 0.0).cpu().numpy().squeeze().astype(bool)
-                        nb = n_blobs_map.get(oid, s.objects.get(oid, {}).get("n_blobs", 1))
-                        s.masks[abs_si][oid] = m
-                        s.bboxes[abs_si][oid] = mask_to_bbox(m, nb)
+                    if hasattr(obj_ids, "cpu"):
+                        obj_ids_arr = obj_ids.cpu().numpy().reshape(-1)
+                    else:
+                        obj_ids_arr = np.asarray(obj_ids).reshape(-1)
+                    obj_ids_list = [int(v) for v in obj_ids_arr]
+                    masks_np = (masks_t > 0.0).cpu().numpy()
+                    n_items = min(len(obj_ids_list), len(masks_np))
+                    if n_items > 1 and self._obj_workers > 1:
+                        futures = []
+                        for i in range(n_items):
+                            oid = obj_ids_list[i]
+                            nb = n_blobs_map.get(oid, s.objects.get(oid, {}).get("n_blobs", 1))
+                            futures.append(self._obj_pool.submit(self._mask_bbox_task, oid, masks_np[i], nb))
+                        for fut in futures:
+                            oid, m, bb = fut.result()
+                            s.masks[abs_si][oid] = m
+                            s.bboxes[abs_si][oid] = bb
+                    else:
+                        for i in range(n_items):
+                            oid = obj_ids_list[i]
+                            nb = n_blobs_map.get(oid, s.objects.get(oid, {}).get("n_blobs", 1))
+                            _, m, bb = self._mask_bbox_task(oid, masks_np[i], nb)
+                            s.masks[abs_si][oid] = m
+                            s.bboxes[abs_si][oid] = bb
                     s.progress = rel_idx + 1
 
                 self.predictor.reset_state(inf)
@@ -649,7 +788,9 @@ class SAM2Tracker:
                     s.objects[oid]["obj_start"] = new_start
                     s.objects[oid]["obj_end"] = new_end
             print(f"[sam2] Done — {len(s.masks)} frames, {len(s.objects)} objects, {n_total} bboxes ✓")
-            self._autosave()
+            # Make results visible to frontend immediately; persist in background.
+            s.running = False
+            self._autosave_background()
 
         except Exception as e:
             s.error = f"{type(e).__name__}: {e}"
@@ -713,6 +854,7 @@ body{font-family:'IBM Plex Sans',system-ui,sans-serif;background:var(--bg);color
 .tobj .oof-btn:hover{border-color:var(--border-h)}
 .tobj .ext-btn{font-size:10px;padding:2px 6px;border:1px solid #0a5c47;border-radius:3px;cursor:pointer;background:#073b2e;color:var(--green);transition:all .15s;font-weight:600}
 .tobj .ext-btn:hover{background:#0a5240}
+.tobj .ext-btn.disabled{background:#1a2535;border-color:var(--border);color:var(--dim);opacity:.55;cursor:not-allowed;pointer-events:none}
 .actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px}
 .actions button{font-family:'IBM Plex Sans',sans-serif;font-size:13px;font-weight:500;padding:7px 16px;border-radius:5px;border:1px solid var(--border);background:var(--panel);color:var(--text);cursor:pointer;transition:all .15s}
 .actions button:hover{border-color:var(--border-h);background:#1a2535}
@@ -839,6 +981,7 @@ fetch('/api/info').then(r=>r.json()).then(d=>{
 function selLbl(n,h){S.activeLabel=n;S.activeColor=h;
   document.querySelectorAll('.label-pill').forEach(b=>b.classList.toggle('active',b.dataset.label===n));}
 function instHex(l){var i=S.instruments.find(x=>x.name===l);return i?i.hex:'#fff';}
+function defaultNBlobs(label){return label==='Bipolar'?4:2;}
 function rgb(a){return 'rgb('+a[0]+','+a[1]+','+a[2]+')';}
 
 function loadImg(u){return new Promise((r,j)=>{var i=new Image();i.onload=()=>r(i);i.onerror=j;i.src=u;});}
@@ -857,25 +1000,45 @@ async function loadFrame(n){
   document.getElementById('iTime').textContent=n+'s';
   document.getElementById('tlCur').style.left=(S.total>1?(n/(S.total-1))*100:0)+'%';
   var myId=++_loadId;
-  var newFrame;
-  try{newFrame=await loadImg('/api/frame/'+n+'?t='+Date.now());}catch(e){return;}
-  if(_loadId!==myId)return;/* superseded by newer loadFrame call */
-  var newMask=null;
-  if(S.tracked){
-    if(S.fdCache[n]===undefined){
-      try{var r=await fetch('/api/framedata/'+n);if(_loadId!==myId)return;S.fdCache[n]=r.ok?await r.json():null;}
-      catch(e){S.fdCache[n]=null;}}
-    if(n>=S.tracked.start&&n<=S.tracked.end){
-      if(S.maskCache[n]===undefined){
-        try{newMask=await loadImg('/api/mask/'+n);if(_loadId!==myId)return;S.maskCache[n]=newMask;}
-        catch(e){S.maskCache[n]=null;}}
-      else newMask=S.maskCache[n];
+  var framePromise=loadImg('/api/frame/'+n+'?t='+Date.now());
+  var fdPromise=Promise.resolve(S.fdCache[n]);
+  if(S.tracked&&S.fdCache[n]===undefined){
+    fdPromise=fetch('/api/framedata/'+n)
+      .then(r=>r.ok?r.json():null)
+      .catch(()=>null)
+      .then(fd=>{S.fdCache[n]=fd;return fd;});
+  }
+  var maskPromise=Promise.resolve(null);
+  if(S.tracked&&n>=S.tracked.start&&n<=S.tracked.end){
+    if(S.maskCache[n]===undefined){
+      maskPromise=loadImg('/api/mask/'+n)
+        .then(img=>{S.maskCache[n]=img;return img;})
+        .catch(()=>{S.maskCache[n]=null;return null;});
+    }else{
+      maskPromise=Promise.resolve(S.maskCache[n]);
     }
   }
-  if(_loadId!==myId)return;
-  frameImg=newFrame;maskImg=newMask;
+
+  var newFrame;
+  try{newFrame=await framePromise;}catch(e){return;}
+  if(_loadId!==myId)return;/* superseded by newer loadFrame call */
+
+  frameImg=newFrame;
+  maskImg=null;
   if(canvas.width!==frameImg.naturalWidth)canvas.width=frameImg.naturalWidth;
   if(canvas.height!==frameImg.naturalHeight)canvas.height=frameImg.naturalHeight;
+  redr();
+
+  if(!S.tracked){updTrkList();updTimeline();return;}
+
+  try{
+    var res=await Promise.all([fdPromise,maskPromise]);
+    if(_loadId!==myId)return;
+    maskImg=res[1];
+  }catch(e){
+    if(_loadId!==myId)return;
+    maskImg=null;
+  }
   redr();updTrkList();updTimeline();
 }
 
@@ -968,7 +1131,7 @@ canvas.addEventListener('mouseup',e=>{
   if(!drag)return;
   if(drag.type==='draw'){var b=drag.box;
     if(b&&(b[2]-b[0]>10)&&(b[3]-b[1]>10)){
-      S.boxes.push({x1:b[0],y1:b[1],x2:b[2],y2:b[3],label:S.activeLabel,color:S.activeColor,n_blobs:2});
+      S.boxes.push({x1:b[0],y1:b[1],x2:b[2],y2:b[3],label:S.activeLabel,color:S.activeColor,n_blobs:defaultNBlobs(S.activeLabel)});
       updBoxList();}}
   else if(drag.box){S.fdCache[S.frame][drag.oid].bbox=drag.box;
     fetch('/api/update_bbox',{method:'POST',headers:{'Content-Type':'application/json'},
@@ -991,11 +1154,12 @@ function redr(){
   if(drag&&drag.type==='draw'&&drag.box){var db=drag.box;drawNBox(db[0],db[1],db[2],db[3],S.activeColor,S.activeLabel);}
 }
 function drawTBox(x1,y1,x2,y2,col,lbl,ca,oid){
+  var dLbl='#'+oid+' '+lbl;
   ctx.strokeStyle=col;ctx.lineWidth=3;ctx.setLineDash([]);ctx.strokeRect(x1,y1,x2-x1,y2-y1);
   ctx.fillStyle='rgba('+ca[0]+','+ca[1]+','+ca[2]+',0.08)';ctx.fillRect(x1,y1,x2-x1,y2-y1);
-  ctx.font='bold 13px IBM Plex Sans,sans-serif';var tw=ctx.measureText(lbl).width+10,th=20;
+  ctx.font='bold 13px IBM Plex Sans,sans-serif';var tw=ctx.measureText(dLbl).width+10,th=20;
   var ly=y1>th+4?y1-th-2:y2+2;ctx.fillStyle=col;ctx.fillRect(x1,ly,tw,th);
-  ctx.fillStyle='#fff';ctx.fillText(lbl,x1+5,ly+15);
+  ctx.fillStyle='#fff';ctx.fillText(dLbl,x1+5,ly+15);
   /* store label rect for click detection */
   S.labelRects.push({x:x1,y:ly,w:tw,h:th,oid:oid,label:lbl});
   var hs=7;ctx.fillStyle=col;
@@ -1035,7 +1199,7 @@ function updTrkList(){
     var o=objs[oid],c=instHex(o.label);
     var hasMask=!!(fd&&fd[oid]&&fd[oid].bbox_raw);
     var isOof=!!(fd&&fd[oid]&&fd[oid].oof);
-    var nb=o.n_blobs||2;
+    var nb=(o.n_blobs!=null)?o.n_blobs:defaultNBlobs(o.label);
     var objEnd=o.obj_end!=null?o.obj_end:(S.tracked?S.tracked.end:null);
     var atObjEnd=objEnd!=null&&S.frame>=objEnd;
     var row='<div class="tobj"><span class="bdot" style="background:'+c+'"></span>';
@@ -1050,7 +1214,10 @@ function updTrkList(){
       row+='<span class="oof-btn active" onclick="togOof('+oid+')">OOF</span>';
     }else{
       row+='<span class="oof-btn" onclick="togOof('+oid+')">vis</span>';
-      if(atObjEnd)row+='<span class="ext-btn" onclick="extendObj('+oid+')" title="Extend tracking from frame '+objEnd+'">▸trk</span>';
+      if(atObjEnd){
+        if(S.tracking)row+='<span class="ext-btn disabled" title="Tracking in progress">trk...</span>';
+        else row+='<span class="ext-btn" onclick="extendObj('+oid+')" title="Extend tracking from frame '+objEnd+'">▸trk</span>';
+      }
     }
     row+='<button onclick="delObj('+oid+')" title="Delete entire series">×</button></div>';
     if(isOof)hOof+=row;
@@ -1063,11 +1230,14 @@ function updTrkList(){
 
 function updUI(){
   var hb=S.boxes.length>0,ht=S.tracked!==null;
-  document.getElementById('trackBtn').disabled=!hb||S.tracking;
+  var trackBtn=document.getElementById('trackBtn');
+  trackBtn.disabled=!hb||S.tracking;
+  trackBtn.textContent=S.tracking?'tracking...':'▸ track';
   ['cbMaskLbl','cbBoxLbl','expVid','expDat','rstBtn'].forEach(id=>
     document.getElementById(id).classList.toggle('hidden',!ht));
   document.getElementById('trkWrap').classList.toggle('hidden',!ht);
   document.getElementById('progRow').classList.toggle('hidden',!S.tracking);
+  if(ht)updTrkList();
 }
 
 function jmp(d){loadFrame(S.frame+d);}
@@ -1091,7 +1261,7 @@ async function startTrack(){
   if(!S.boxes.length||S.tracking)return;
   var dur=+document.getElementById('durIn').value||50;
   S.tracking=true;updUI();
-  var bd=S.boxes.map(b=>({box:[b.x1,b.y1,b.x2,b.y2],label:b.label,n_blobs:b.n_blobs||1}));
+  var bd=S.boxes.map(b=>({box:[b.x1,b.y1,b.x2,b.y2],label:b.label,n_blobs:(b.n_blobs!=null)?b.n_blobs:defaultNBlobs(b.label)}));
   var r=await fetch('/api/track',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({frame:S.frame,boxes:bd,duration:dur})});
   if(!r.ok){toast('Failed',true);S.tracking=false;updUI();return;}
@@ -1424,10 +1594,23 @@ if __name__ == "__main__":
         print("            cd ~/sam2 && pip install -e .\n")
 
     # Autoload previous session
-    if tracker._autoload():
+    autoload_ok = tracker._autoload()
+    if autoload_ok:
         print("[main] Restored previous tracking session")
 
     if "--export-labeled" in sys.argv:
+        if not autoload_ok:
+            print(f"[main] No autosave session restored from: {AUTOSAVE_DIR / 'state.json'}")
+            if AUTOSAVE_DIR.exists():
+                try:
+                    names = sorted(p.name for p in AUTOSAVE_DIR.iterdir())
+                    print(f"[main] Autosave dir exists with files: {names}")
+                except Exception as e:
+                    print(f"[main] Could not list autosave dir: {e}")
+            else:
+                print(f"[main] Autosave dir does not exist: {AUTOSAVE_DIR}")
+        s = tracker.state
+        print(f"[main] Export debug state: objects={len(s.objects)} mask_frames={len(s.masks)} bbox_frames={len(s.bboxes)} start={s.start} end={s.end}")
         out_path = EXPORT_DIR / "ALTR-20.mp4"
         ok = tracker.export_video(video, str(out_path))
         print(f"[export] {'OK' if ok else 'FAIL'} → {out_path}")
