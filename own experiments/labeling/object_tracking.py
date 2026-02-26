@@ -23,7 +23,8 @@ Install SAM2:
 import multiprocessing as mp
 mp.set_start_method("spawn", force=True)
 
-import os, sys, json, shutil, subprocess, tempfile, threading, traceback, time
+import os, sys, json, re, shutil, subprocess, threading, traceback, time, bisect
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -34,14 +35,32 @@ import torch
 # ═══════════════════════════════════════════════════════════════
 #  CONFIG
 # ═══════════════════════════════════════════════════════════════
-VIDEO_PATH    = Path("/home/moritz/Foundential Model/own experiments/labeling/test_videos/TL-034_vestibular_schwannoma_resection_11062021_21390469_NK.mp4")
+VIDEO_PATH    = None   # set automatically from last-used video; use the picker to select
 PORT          = 8765
 SAMPLE_FPS    = 1
 TRACK_SECONDS = 50
 SAM2_HF_ID   = "facebook/sam2-hiera-large"
 PROJECT_ROOT  = Path(__file__).resolve().parents[2]
 EXPORT_DIR    = PROJECT_ROOT / "tracking_exports"
-AUTOSAVE_DIR  = EXPORT_DIR / "autosave" / VIDEO_PATH.stem
+AUTOSAVE_DIR  = None   # computed once a video is loaded
+
+# Temporal filtering.
+# Set FEATURES_ROOT to a Path to pin a specific directory, or leave None to
+# auto-discover (searches sibling directories of VIDEO_PATH and known paths).
+# Expected layout: FEATURES_ROOT / VIDEO_PATH.stem / *.npy
+FILTERED_FRAMES_ROOT  = Path("/media/HDD1/moritz/foundential/Extracted Frames/test")
+FEATURES_ROOT         = None   # auto-discovered when None
+VIDEO_PICKER_DIR      = Path("/media/HDD1/moritz/foundential/test")   # directory with .mp4 files shown in the picker
+CLIP_LENGTH           = 500   # frames per clip (aim for ~20 chunks across the video)
+TEMPORAL_TOP_FRACTION = 0.20   # fraction of clips to select via diversity sampling
+TEMPORAL_MAX_FRAME    = None    # ignore frames beyond this index (None = use all)
+
+# Display / inference resolution.  All frames served to the frontend are
+# downsampled to this size.  SAM2 masks are also produced at this resolution,
+# so bounding-box coordinates always live in this pixel space.
+# Set to None to use the native video resolution.
+DISPLAY_RESOLUTION    = None   # (width, height)
+
 
 INSTRUMENTS = [
     {"name": "Bipolar",         "hex": "#ef476f", "rgb": [239,  71, 111]},
@@ -130,6 +149,8 @@ class VideoReader:
     def frame_jpeg(self, sample_idx, q=85):
         f = self.get_frame(sample_idx)
         if f is None: return None
+        if DISPLAY_RESOLUTION is not None:
+            f = cv2.resize(f, DISPLAY_RESOLUTION, interpolation=cv2.INTER_LINEAR)
         _, buf = cv2.imencode(".jpg", f, [cv2.IMWRITE_JPEG_QUALITY, q])
         return buf.tobytes()
 
@@ -208,8 +229,521 @@ class VideoReader:
     def close(self): self._cap.release()
 
 # ═══════════════════════════════════════════════════════════════
+#  FRAME DIRECTORY READER
+# ═══════════════════════════════════════════════════════════════
+_IMG_EXTS = {'.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.tif', '.webp'}
+
+class FrameReader:
+    """Read frames from a sorted directory of image files (same interface as VideoReader)."""
+    def __init__(self, path, sample_fps=SAMPLE_FPS):
+        self.path = Path(path)
+        self._files = sorted(
+            f for f in self.path.iterdir()
+            if f.suffix.lower() in _IMG_EXTS
+        )
+        if not self._files:
+            raise ValueError(f"No image files found in {path}")
+        first = cv2.imread(str(self._files[0]))
+        if first is None:
+            raise ValueError(f"Cannot read first image: {self._files[0]}")
+        self.height, self.width = first.shape[:2]
+        self.orig_fps    = sample_fps
+        self.orig_total  = len(self._files)
+        self.step        = 1        # every file is one sample
+        self.sample_map  = list(range(self.orig_total))
+        self.total       = self.orig_total
+        self._lock       = threading.Lock()
+        print(f"[frames] {self.total} images in '{self.path.name}'")
+
+    def get_frame(self, sample_idx):
+        if sample_idx < 0 or sample_idx >= self.total: return None
+        with self._lock:
+            return cv2.imread(str(self._files[sample_idx]))
+
+    def frame_jpeg(self, sample_idx, q=85):
+        f = self.get_frame(sample_idx)
+        if f is None: return None
+        if DISPLAY_RESOLUTION is not None:
+            f = cv2.resize(f, DISPLAY_RESOLUTION, interpolation=cv2.INTER_LINEAR)
+        _, buf = cv2.imencode(".jpg", f, [cv2.IMWRITE_JPEG_QUALITY, q])
+        return buf.tobytes()
+
+    def extract_range_to_dir(self, start_sample, count, out_dir):
+        Path(out_dir).mkdir(parents=True, exist_ok=True)
+        if count <= 0 or start_sample >= self.total:
+            return 0
+        start_sample = max(0, int(start_sample))
+        wanted = min(int(count), self.total - start_sample)
+        for p in Path(out_dir).glob("*.jpg"):
+            try: p.unlink()
+            except OSError: pass
+        written = 0
+        for i in range(wanted):
+            si = start_sample + i
+            if si >= self.total: break
+            f = self.get_frame(si)
+            if f is None: break
+            cv2.imwrite(os.path.join(out_dir, f"{i:06d}.jpg"), f)
+            written += 1
+        return written
+
+    def close(self): pass
+
+
+def make_video_source(path, sample_fps=SAMPLE_FPS):
+    """Return a FrameReader for a directory or a VideoReader for a video file."""
+    p = Path(path)
+    if p.is_dir():
+        return FrameReader(p, sample_fps)
+    return VideoReader(p, sample_fps)
+
+
+# ═══════════════════════════════════════════════════════════════
+#  TEMPORAL CLIP SELECTOR
+# ═══════════════════════════════════════════════════════════════
+
+# Primary known root (structure: root/dataset/video_name/*.npy)
+_KNOWN_FEAT_ROOTS = [
+    Path("/media/HDD1/moritz/Extracted Frames embeddings"),
+    Path("/media/HDD1/moritz/foundential/Extracted Frames Features"),
+    Path("/media/HDD1/moritz/foundential/Extracted Frames Embeddings"),
+    # baseline.ipynb Cholec80 embeddings (sibling of labeling/)
+    Path(__file__).resolve().parents[1] / "Cholec80" / "DINO_cholec_embeddings",
+    Path(__file__).resolve().parents[1] / "Cholec80" / "Convenxt_cholec_embeddings",
+]
+_FEAT_KEYWORDS = {"feature", "features", "embed", "embeddings", "emb", "feat"}
+
+
+_PREFIX_MATCH_PREFIXES = ("RS", "TL")  # only stems starting with these use prefix matching
+
+def _prefix_key(stem: str) -> str:
+    """Return the short ID prefix used for fuzzy matching.
+    Only applies when the stem starts with one of _PREFIX_MATCH_PREFIXES.
+    'RS-034_vestibular_schwannoma_...' → 'RS-034',  'TL-052' → 'TL-052'.
+    All other stems are returned unchanged (no prefix matching)."""
+    if any(stem.startswith(p) for p in _PREFIX_MATCH_PREFIXES):
+        return stem.split('_')[0]
+    return stem
+
+
+def _match_stem(stem: str, candidates) -> str:
+    """Return the best match for stem among a collection of names.
+    Priority: exact match > any name that starts with _prefix_key(stem) > original stem."""
+    cands = list(candidates)
+    if stem in cands:
+        return stem
+    prefix = _prefix_key(stem)
+    for c in sorted(cands):
+        if c.startswith(prefix):
+            return c
+    return stem
+
+
+def _resolve_stem_in_dir(stem: str, directory: Path) -> str:
+    """Find the best-matching existing subdirectory name for stem under directory.
+    Returns stem unchanged when no match is found (caller will create a new dir)."""
+    if not directory.is_dir():
+        return stem
+    return _match_stem(stem, (e.name for e in directory.iterdir() if e.is_dir()))
+
+
+def _load_allowed_frames(filtered_root: Path | None, video, video_name: str | None = None) -> list[int] | None:
+    """
+    Return sorted list of allowed sample indices based on which frames exist in
+    filtered_root/video_name.  Returns None if no filtering is configured.
+
+    For FrameReader: matches by filename stem against video._files[i].stem.
+    For VideoReader: parses numeric stems directly as sample indices.
+
+    Searches recursively under filtered_root if the direct path is not found,
+    so setting filtered_root to a parent directory (e.g. "test") will still
+    find "test/VS_Retrosigmoid/RS-034_...".
+    """
+    if filtered_root is None:
+        return None
+    if video_name is None:
+        video_name = VIDEO_PATH.stem
+    folder = filtered_root / _resolve_stem_in_dir(video_name, filtered_root)
+    if not folder.is_dir():
+        # Search recursively — try exact name then prefix match at each level
+        prefix = _prefix_key(video_name)
+        matches = [
+            m for m in filtered_root.rglob("*")
+            if m.is_dir() and (m.name == video_name or m.name.startswith(prefix))
+        ]
+        if matches:
+            # prefer exact, otherwise first prefix hit
+            exact = [m for m in matches if m.name == video_name]
+            folder = (exact or matches)[0]
+            print(f"[filter] Found folder: {folder}")
+        else:
+            print(f"[filter] Folder not found for '{video_name}' (prefix '{prefix}') under {filtered_root}")
+            return None
+
+    present_stems = {p.stem for p in folder.iterdir() if p.suffix.lower() in _IMG_EXTS}
+    if not present_stems:
+        # Folder matched by name/prefix but contains no images directly —
+        # search one level deeper (e.g. test/MVD/ → test/MVD/RS-034_.../)
+        prefix = _prefix_key(video_name)
+        deeper = None
+        for sub in sorted(folder.iterdir()):
+            if not sub.is_dir():
+                continue
+            if sub.name == video_name or sub.name.startswith(prefix):
+                stems = {p.stem for p in sub.iterdir() if p.suffix.lower() in _IMG_EXTS}
+                if stems:
+                    deeper = sub
+                    present_stems = stems
+                    break
+        if deeper is None:
+            print(f"[filter] No images found in {folder} or its subdirectories")
+            return None
+        folder = deeper
+        print(f"[filter] Found images one level deeper: {folder}")
+
+    allowed = []
+    if hasattr(video, "_files"):  # FrameReader — match by stem
+        for i, f in enumerate(video._files):
+            if f.stem in present_stems:
+                allowed.append(i)
+    else:  # VideoReader — extract trailing number from stem (handles "frame_000001" etc.)
+        _num_re = re.compile(r'(\d+)$')
+        for stem in present_stems:
+            m = _num_re.search(stem)
+            if m:
+                allowed.append(int(m.group(1)))
+
+    allowed.sort()
+    total = video.total
+    filtered_out = total - len(allowed)
+    print(f"[filter] {len(allowed)}/{total} frames allowed ({filtered_out} filtered out)")
+    return allowed
+
+
+def _find_features_root(video_path: Path) -> Path | None:
+    """
+    Auto-discover the features root containing per-frame .npy embeddings.
+
+    Supports both flat   (root/video_name/*.npy)
+    and nested           (root/dataset/video_name/*.npy)  layouts.
+
+    Search order:
+      1. Known hardcoded roots.
+      2. Keyword-matching siblings of each ancestor directory of video_path.
+    """
+    video_name = video_path.stem
+
+    def _has_embeddings(root: Path) -> bool:
+        if not root.is_dir():
+            return False
+        # flat layout: root / {video_name or prefix-match}
+        resolved = _resolve_stem_in_dir(video_name, root)
+        direct = root / resolved
+        if direct.is_dir() and any(direct.rglob("*.npy")):
+            return True
+        # nested layout: root / dataset / {video_name or prefix-match}
+        for dataset_dir in root.iterdir():
+            if not dataset_dir.is_dir():
+                continue
+            resolved_sub = _resolve_stem_in_dir(video_name, dataset_dir)
+            sub = dataset_dir / resolved_sub
+            if sub.is_dir() and any(sub.rglob("*.npy")):
+                return True
+        return False
+
+    candidates: list[Path] = list(_KNOWN_FEAT_ROOTS)
+
+    p = video_path if video_path.is_dir() else video_path.parent
+    for _ in range(6):
+        parent = p.parent
+        try:
+            for sibling in sorted(parent.iterdir()):
+                if sibling.is_dir() and sibling != p and sibling not in candidates:
+                    if any(kw in sibling.name.lower() for kw in _FEAT_KEYWORDS):
+                        candidates.append(sibling)
+        except PermissionError:
+            pass
+        p = parent
+
+    for cand in candidates:
+        if cand.exists() and _has_embeddings(cand):
+            print(f"[temporal] Found features root: {cand}")
+            return cand
+
+    print(f"[temporal] No features root found for '{video_name}' — temporal filtering disabled")
+    return None
+
+
+def _load_video_embeddings(features_root: Path, video_name: str):
+    """Load all .npy embeddings for a video folder, sorted by filename.
+
+    Supports flat (features_root/video_name/) and nested
+    (features_root/dataset/video_name/) layouts.
+    """
+    # flat layout — exact or prefix match
+    vdir = features_root / _resolve_stem_in_dir(video_name, features_root)
+    if not vdir.is_dir():
+        # nested: features_root/{dataset}/{video_name or prefix-match}/
+        for dataset_dir in sorted(features_root.iterdir()):
+            if not dataset_dir.is_dir():
+                continue
+            resolved = _resolve_stem_in_dir(video_name, dataset_dir)
+            candidate = dataset_dir / resolved
+            if candidate.is_dir():
+                vdir = candidate
+                break
+    if not vdir.is_dir():
+        print(f"[temporal] No embedding dir found for '{video_name}' in {features_root}")
+        return None
+    paths = sorted(vdir.rglob("*.npy"))
+    if not paths:
+        print(f"[temporal] No .npy files in {vdir}")
+        return None
+    feats = []
+    stem_nums = []
+    _num_re = re.compile(r'(\d+)$')
+    for p in paths:
+        try:
+            feats.append(np.load(p).astype(np.float32))
+            m = _num_re.search(p.stem)
+            stem_nums.append(int(m.group(1)) if m else len(stem_nums))
+        except Exception as e:
+            print(f"[temporal] Skip {p.name}: {e}")
+    return (np.vstack(feats) if feats else None), stem_nums
+
+
+def _load_clips_cache(cache_dir: Path, clip_length: int, top_fraction: float, max_frame) -> list | None:
+    """Load cached temporal clips if params match, else return None."""
+    p = cache_dir / "temporal_clips.json"
+    if not p.exists():
+        return None
+    try:
+        with open(p) as f:
+            d = json.load(f)
+        if (d.get("clip_length") == clip_length
+                and d.get("top_fraction") == top_fraction
+                and d.get("max_frame") == max_frame):
+            clips = d.get("clips", [])
+            print(f"[temporal] Loaded {len(clips)} clips from cache")
+            return clips
+    except Exception as e:
+        print(f"[temporal] Cache load error: {e}")
+    return None
+
+
+def _save_clips_cache(cache_dir: Path, clips: list, clip_length: int, top_fraction: float, max_frame):
+    """Persist temporal clips to disk so they survive restarts."""
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        with open(cache_dir / "temporal_clips.json", "w") as f:
+            json.dump({"clip_length": clip_length, "top_fraction": top_fraction,
+                       "max_frame": max_frame, "clips": clips}, f)
+        print(f"[temporal] Saved {len(clips)} clips to cache → {cache_dir.name}")
+    except Exception as e:
+        print(f"[temporal] Cache save error: {e}")
+
+
+_CACHE_MISS = object()  # sentinel: value not yet cached
+
+
+def _load_features_root_cache(autosave_dir: Path):
+    """Return cached features root path, None (not found), or _CACHE_MISS."""
+    p = autosave_dir / "features_root.json"
+    if not p.exists():
+        return _CACHE_MISS
+    try:
+        with open(p) as f:
+            d = json.load(f)
+        raw = d.get("path", _CACHE_MISS)
+        if raw is _CACHE_MISS:
+            return _CACHE_MISS
+        return Path(raw) if raw is not None else None
+    except Exception:
+        return _CACHE_MISS
+
+
+def _save_features_root_cache(autosave_dir: Path, root):
+    try:
+        autosave_dir.mkdir(parents=True, exist_ok=True)
+        with open(autosave_dir / "features_root.json", "w") as f:
+            json.dump({"path": str(root) if root is not None else None}, f)
+    except Exception as e:
+        print(f"[cache] features_root save error: {e}")
+
+
+def _load_allowed_frames_cache(autosave_dir: Path):
+    """Return cached allowed-frames list, None (no filter), or _CACHE_MISS."""
+    p = autosave_dir / "allowed_frames.json"
+    if not p.exists():
+        return _CACHE_MISS
+    try:
+        with open(p) as f:
+            d = json.load(f)
+        if "frames" not in d:
+            return _CACHE_MISS
+        return d["frames"]  # list[int] or null → None
+    except Exception:
+        return _CACHE_MISS
+
+
+def _save_allowed_frames_cache(autosave_dir: Path, frames):
+    try:
+        autosave_dir.mkdir(parents=True, exist_ok=True)
+        with open(autosave_dir / "allowed_frames.json", "w") as f:
+            json.dump({"frames": frames}, f)
+    except Exception as e:
+        print(f"[cache] allowed_frames save error: {e}")
+
+
+def compute_temporal_clips(
+        features_root: Path,
+        video_name: str,
+        clip_length: int = 2000,
+        top_fraction: float = 0.20,
+        max_frame: int | None = None,
+        cache_dir: Path | None = None,
+) -> list:
+    """
+    Divide the embedding sequence into non-overlapping clips, compute a mean
+    embedding per clip, then use greedy max-min diversity (L2) selection to
+    pick the most spread-out top_fraction of clips.
+
+    Selection rule:
+      1. Start with the clip whose mean is furthest from the global mean.
+      2. Each next pick is the clip furthest from all already-selected clips
+         (maximises minimum pairwise distance).
+
+    Short-tail correction: if the last selected clip (by frame order) has
+    fewer than clip_length/2 frames, add one more diverse clip.
+
+    Each returned dict: {"start": int, "end": int, "score": float}
+    where score = L2 distance from global mean (for debug display).
+    """
+    if cache_dir is not None:
+        cached = _load_clips_cache(cache_dir, clip_length, top_fraction, max_frame)
+        if cached is not None:
+            return cached
+
+    features, stem_nums = _load_video_embeddings(features_root, video_name)
+    if features is None:
+        return []
+    n = len(features)
+    if max_frame is not None:
+        n = min(n, max_frame)
+        stem_nums = stem_nums[:n]
+        print(f"[temporal] Capped at frame {max_frame} ({n} frames used)")
+
+    # Build per-clip mean embeddings; start/end are stem frame numbers
+    clips, means = [], []
+    for arr_start in range(0, n, clip_length):
+        arr_end = min(arr_start + clip_length - 1, n - 1)
+        chunk = features[arr_start:arr_end + 1].astype(np.float32)
+        clips.append({"start": stem_nums[arr_start], "end": stem_nums[arr_end]})
+        means.append(chunk.mean(axis=0))
+    if not clips:
+        return []
+
+    means = np.array(means)           # (n_clips, embed_dim)
+    n_clips = len(clips)
+    global_mean = means.mean(axis=0)
+    dists_to_global = np.linalg.norm(means - global_mean, axis=1)
+
+    # Determine how many clips to select
+    total_frames = sum(c["end"] - c["start"] + 1 for c in clips)
+    n_select = max(1, int(n_clips * top_fraction))
+    # Bump if frame coverage is below target
+    covered = sum(clips[i]["end"] - clips[i]["start"] + 1 for i in range(n_select))
+    if covered < total_frames * top_fraction and n_select < n_clips:
+        n_select += 1
+        print(f"[temporal] Added 1 extra clip to reach ≥{top_fraction*100:.0f}% frame coverage")
+
+    # Greedy max-min diversity selection
+    selected = [int(np.argmax(dists_to_global))]
+    while len(selected) < n_select:
+        min_dists = [
+            -1 if i in selected
+            else min(np.linalg.norm(means[i] - means[s]) for s in selected)
+            for i in range(n_clips)
+        ]
+        selected.append(int(np.argmax(min_dists)))
+
+    # Short-tail correction
+    top = sorted([{**clips[i], "score": float(dists_to_global[i])} for i in selected],
+                 key=lambda c: c["start"])
+    last_frames = top[-1]["end"] - top[-1]["start"] + 1
+    if last_frames < clip_length / 2 and len(selected) < n_clips:
+        remaining = [i for i in range(n_clips) if i not in selected]
+        next_idx = max(remaining,
+                       key=lambda i: min(np.linalg.norm(means[i] - means[s]) for s in selected))
+        top.append({**clips[next_idx], "score": float(dists_to_global[next_idx])})
+        top.sort(key=lambda c: c["start"])
+        selected.append(next_idx)
+        print(f"[temporal] Added 1 extra clip (short tail: {last_frames} < {clip_length//2} frames)")
+
+    covered_final = sum(c["end"] - c["start"] + 1 for c in top)
+    print(f"[temporal] {len(top)}/{n_clips} clips selected "
+          f"(diversity sampling, coverage={covered_final}/{total_frames} "
+          f"frames = {100*covered_final/total_frames:.1f}%)")
+    print(f"[temporal] All clips (L2 dist from global mean):")
+    selected_starts = {c["start"] for c in top}
+    for i, c in enumerate(clips):
+        marker = " ◀ selected" if c["start"] in selected_starts else ""
+        print(f"  clip {i:>2}  frames {c['start']:>5}-{c['end']:>5}  "
+              f"dist={dists_to_global[i]:.4f}{marker}")
+
+    if cache_dir is not None:
+        _save_clips_cache(cache_dir, top, clip_length, top_fraction, max_frame)
+    return top
+
+
+# ═══════════════════════════════════════════════════════════════
 #  SAM2 TRACKER  (with all extended features)
 # ═══════════════════════════════════════════════════════════════
+def _cap_duration_to_clip(video, start_sample: int, duration: int, clips: list) -> int:
+    """Cap tracking duration so it doesn't enter a non-selected region.
+
+    Starts in the clip containing start_sample, then extends the allowed range
+    through any consecutive selected clips (i.e. clips whose start frame is
+    reachable by the next video sample after the current boundary).  Only stops
+    where there is a genuine gap into unselected territory.
+
+    Returns duration unchanged if start_sample is not inside any clip."""
+    if not clips or start_sample >= video.total:
+        return duration
+    orig_frame = video.sample_map[start_sample]
+
+    # Find the clip containing start_sample
+    coverage_end = None
+    for clip in clips:
+        if clip["start"] <= orig_frame <= clip["end"]:
+            coverage_end = clip["end"]
+            break
+    if coverage_end is None:
+        return duration  # not inside any selected clip — no restriction
+
+    # Walk forward: if the very next video sample after coverage_end falls
+    # inside another selected clip, absorb that clip and keep going.
+    changed = True
+    while changed:
+        changed = False
+        next_idx = bisect.bisect_right(video.sample_map, coverage_end)
+        if next_idx >= len(video.sample_map):
+            break
+        next_frame = video.sample_map[next_idx]
+        for clip in clips:
+            if clip["start"] <= next_frame <= clip["end"]:
+                coverage_end = clip["end"]
+                changed = True
+                break
+
+    last_in_coverage = bisect.bisect_right(video.sample_map, coverage_end) - 1
+    max_frames = max(1, last_in_coverage - start_sample + 1)
+    capped = min(duration, max_frames)
+    if capped < duration:
+        print(f"[clips] capped duration {duration}→{capped} (coverage ends at frame {coverage_end})")
+    return capped
+
+
 def _load_predictor():
     try:
         from sam2.sam2_video_predictor import SAM2VideoPredictor
@@ -252,7 +786,8 @@ class TrackerState:
 
 
 class SAM2Tracker:
-    def __init__(self):
+    def __init__(self, autosave_dir: Path | None = None):
+        self.autosave_dir = autosave_dir if autosave_dir is not None else AUTOSAVE_DIR
         self.predictor = _load_predictor()
         self.state = TrackerState()
         self._tmp = None
@@ -266,7 +801,7 @@ class SAM2Tracker:
     def available(self): return self.predictor is not None
 
     # ─── actions ──────────────────────────────────
-    def start_tracking(self, video, sample_idx, boxes, duration_sec):
+    def start_tracking(self, video, sample_idx, boxes, duration_sec, clips=None):
         if self.state.running: return
         s = self.state
         s.running = True; s.error = None
@@ -278,7 +813,7 @@ class SAM2Tracker:
                 "obj_start": None, "obj_end": None,
             }
         t = threading.Thread(target=self._run,
-            args=(video, sample_idx, boxes, duration_sec, next_id), daemon=True)
+            args=(video, sample_idx, boxes, duration_sec, next_id, clips), daemon=True)
         t.start()
 
     def reset(self):
@@ -345,6 +880,24 @@ class SAM2Tracker:
         self._autosave()
         return True
 
+    def trim_object_from(self, oid, from_frame):
+        """Remove masks/bboxes for frames >= from_frame for a single object. Keeps past data."""
+        s = self.state
+        if oid not in s.objects: return False
+        for si in list(s.masks.keys()):
+            if si >= from_frame:
+                s.masks[si].pop(oid, None)
+                s.bboxes.get(si, {}).pop(oid, None)
+                if not s.masks[si]: del s.masks[si]
+                if si in s.bboxes and not s.bboxes[si]: del s.bboxes[si]
+        # Update obj_end to last remaining frame with data
+        remaining = [si for si in s.masks if oid in s.masks[si]]
+        s.objects[oid]["obj_end"] = max(remaining) if remaining else s.objects[oid].get("obj_start")
+        s.oof.pop(oid, None)
+        self._recalc_range()
+        self._autosave()
+        return True
+
     def _recalc_range(self):
         """Recalculate global start/end from per-object ranges."""
         s = self.state
@@ -361,15 +914,15 @@ class SAM2Tracker:
         s.end = max(ends) if ends else None
 
     # ─── extend single object ─────────────────────
-    def extend_object(self, video, oid, duration_sec):
+    def extend_object(self, video, oid, duration_sec, clips=None):
         if self.state.running: return
         s = self.state
         s.running = True; s.error = None
         t = threading.Thread(target=self._run_extend,
-            args=(video, oid, duration_sec), daemon=True)
+            args=(video, oid, duration_sec, clips), daemon=True)
         t.start()
 
-    def _run_extend(self, video, oid, duration_sec):
+    def _run_extend(self, video, oid, duration_sec, clips=None):
         s = self.state
         try:
             obj_info = s.objects.get(oid)
@@ -390,22 +943,20 @@ class SAM2Tracker:
             if bbox is None:
                 s.error = f"No bbox found for object {oid}"; return
 
+            duration_sec = _cap_duration_to_clip(video, start_from, duration_sec, clips or [])
             n_frames = min(duration_sec, video.total - start_from)
             s.total = n_frames
             new_end = start_from + n_frames - 1
             s.end = max(s.end, new_end) if s.end is not None else new_end
 
-            s.phase = "extracting"
-            self._tmp = tempfile.mkdtemp(prefix="sam2_")
-            written = video.extract_range_to_dir(start_from, n_frames, self._tmp)
-            print(f"[sam2] Extend obj {oid}: {written} frames from sample {start_from}")
-
             nb = obj_info.get("n_blobs", 2)
 
+            # Load frames into memory + init SAM2 state (no JPEG I/O)
             s.phase = "embedding"
+            self._tmp = None
             dtype = _autocast_dtype()
             with torch.inference_mode(), torch.autocast("cuda", dtype=dtype):
-                inf = self.predictor.init_state(video_path=self._tmp)
+                inf = self._build_inference_state(video, start_from, n_frames)
                 box = np.array(bbox, dtype=np.float32)
                 self.predictor.add_new_points_or_box(
                     inference_state=inf, frame_idx=0, obj_id=oid, box=box)
@@ -469,6 +1020,7 @@ class SAM2Tracker:
             result[str(oid)] = {
                 "label": info["label"], "bbox": box, "bbox_raw": box_raw,
                 "color": rgb, "oof": is_oof,
+                "oof_from": s.oof.get(oid),
                 "n_blobs": info.get("n_blobs", 1),
             }
         return result if result else None
@@ -641,7 +1193,7 @@ class SAM2Tracker:
         with self._save_lock:
             try:
                 s = self.state
-                AUTOSAVE_DIR.mkdir(parents=True, exist_ok=True)
+                self.autosave_dir.mkdir(parents=True, exist_ok=True)
                 bboxes_ser = {}
                 for si, bb in s.bboxes.items():
                     bboxes_ser[str(si)] = {str(oid): box for oid, box in bb.items()}
@@ -653,20 +1205,20 @@ class SAM2Tracker:
                     "start": s.start, "end": s.end,
                     "current_frame": s.current_frame,
                 }
-                with open(AUTOSAVE_DIR / "state.json", "w") as f:
+                with open(self.autosave_dir / "state.json", "w") as f:
                     json.dump(data, f)
                 arrays = {}
                 for si, om in s.masks.items():
                     for oid, mask in om.items():
                         arrays[f"s{si:06d}_o{oid}"] = mask
                 if arrays:
-                    np.savez_compressed(AUTOSAVE_DIR / "masks.npz", **arrays)
+                    np.savez_compressed(self.autosave_dir / "masks.npz", **arrays)
                 print(f"[autosave] Saved {len(s.objects)} objects, {len(s.bboxes)} frames")
             except Exception as e:
                 print(f"[autosave] Error: {e}")
 
     def _autoload(self):
-        sp = AUTOSAVE_DIR / "state.json"
+        sp = self.autosave_dir / "state.json"
         if not sp.exists(): return False
         try:
             with open(sp) as f:
@@ -693,7 +1245,7 @@ class SAM2Tracker:
             else:
                 # New format: {oid: frame_from}
                 s.oof = {int(oid): frame_from for oid, frame_from in oof_data.items()}
-            mask_path = AUTOSAVE_DIR / "masks.npz"
+            mask_path = self.autosave_dir / "masks.npz"
             if mask_path.exists():
                 npz = np.load(mask_path)
                 for key in npz.files:
@@ -709,35 +1261,85 @@ class SAM2Tracker:
             return False
 
     def _delete_autosave(self):
-        if AUTOSAVE_DIR.exists():
-            shutil.rmtree(AUTOSAVE_DIR, ignore_errors=True)
+        if self.autosave_dir.exists():
+            shutil.rmtree(self.autosave_dir, ignore_errors=True)
+
+    def reset_for_video(self, autosave_dir: Path) -> bool:
+        """Switch to a different video without reloading the SAM2 predictor."""
+        if self.state.running:
+            return False
+        if self._save_timer:
+            self._save_timer.cancel()
+            self._save_timer = None
+        self.autosave_dir = autosave_dir
+        self.state = TrackerState()
+        self._tmp = None
+        return self._autoload()
+
+    # ─── in-memory frame loading ──────────────────
+    def _build_inference_state(self, video, start_sample, n_frames):
+        """Build SAM2 inference state directly from decoded frames, skipping JPEG I/O."""
+        device     = self.predictor.device
+        image_size = self.predictor.image_size
+        img_mean   = torch.tensor([0.485, 0.456, 0.406], device=device).view(3, 1, 1)
+        img_std    = torch.tensor([0.229, 0.224, 0.225], device=device).view(3, 1, 1)
+
+        images = []
+        for i in range(n_frames):
+            bgr = video.get_frame(start_sample + i)
+            if bgr is None:
+                break
+            rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+            rgb = cv2.resize(rgb, (image_size, image_size), interpolation=cv2.INTER_LINEAR)
+            t   = torch.from_numpy(rgb).permute(2, 0, 1).float() / 255.0
+            images.append((t.to(device) - img_mean) / img_std)
+
+        disp_w, disp_h = DISPLAY_RESOLUTION if DISPLAY_RESOLUTION else (video.width, video.height)
+        inf = {
+            "images":                    images,
+            "num_frames":                len(images),
+            "video_height":              disp_h,
+            "video_width":               disp_w,
+            "device":                    device,
+            "storage_device":            device,
+            "offload_video_to_cpu":      False,
+            "offload_state_to_cpu":      False,
+            "point_inputs_per_obj":      {},
+            "mask_inputs_per_obj":       {},
+            "cached_features":           {},
+            "constants":                 {},
+            "obj_id_to_idx":             OrderedDict(),
+            "obj_idx_to_id":             OrderedDict(),
+            "obj_ids":                   [],
+            "output_dict_per_obj":       {},
+            "temp_output_dict_per_obj":  {},
+            "frames_tracked_per_obj":    {},
+        }
+        self.predictor._get_image_feature(inf, frame_idx=0, batch_size=1)
+        return inf
 
     # ─── SAM2 tracking run ────────────────────────
-    def _run(self, video, sample_idx, boxes, duration_sec, start_oid):
+    def _run(self, video, sample_idx, boxes, duration_sec, start_oid, clips=None):
         s = self.state
         try:
+            duration_sec = _cap_duration_to_clip(video, sample_idx, duration_sec, clips or [])
             n_frames = min(duration_sec, video.total - sample_idx)
             s.total = n_frames
             new_start, new_end = sample_idx, sample_idx + n_frames - 1
             s.start = min(s.start, new_start) if s.start is not None else new_start
             s.end   = max(s.end, new_end) if s.end is not None else new_end
 
-            # Phase 1 — extract frames to temp dir
-            s.phase = "extracting"
-            self._tmp = tempfile.mkdtemp(prefix="sam2_")
-            written = video.extract_range_to_dir(sample_idx, n_frames, self._tmp)
-            print(f"[sam2] Extracted {written} frames → {self._tmp}")
-
             # Build n_blobs map for bbox extraction
             n_blobs_map = {}
             for i, binfo in enumerate(boxes):
                 n_blobs_map[start_oid + i] = int(binfo.get("n_blobs", 1))
 
-            # Phase 2 — init state + add box prompts
+            # Phase 1+2 — load frames into memory + init SAM2 state (no JPEG I/O)
             s.phase = "embedding"
+            self._tmp = None
             dtype = _autocast_dtype()
             with torch.inference_mode(), torch.autocast("cuda", dtype=dtype):
-                inf = self.predictor.init_state(video_path=self._tmp)
+                inf = self._build_inference_state(video, sample_idx, n_frames)
 
                 for i, binfo in enumerate(boxes):
                     oid = start_oid + i
@@ -876,6 +1478,8 @@ body{font-family:'IBM Plex Sans',system-ui,sans-serif;background:var(--bg);color
 .tl-seg{position:absolute;top:2px;bottom:2px;border-radius:4px;opacity:.45}
 .tl-seg:hover{opacity:.70}
 .tl-cur{position:absolute;top:0;width:2px;height:100%;background:var(--red);pointer-events:none}
+.tl-temporal{position:absolute;top:0;height:100%;background:var(--accent);opacity:.13;pointer-events:none;border-radius:3px}
+.pill-temp{background:#1a2636;color:var(--accent);border:1px solid #0a3a4a}
 .hidden{display:none!important}
 .toast{position:fixed;bottom:20px;right:20px;background:#1a2636;border:1px solid var(--border);padding:10px 18px;border-radius:8px;font-size:13px;color:var(--green);transform:translateY(80px);opacity:0;transition:all .3s;z-index:99}
 .toast.show{transform:translateY(0);opacity:1}
@@ -932,6 +1536,7 @@ body{font-family:'IBM Plex Sans',system-ui,sans-serif;background:var(--bg);color
     <button id="expVid" class="btn-export hidden" onclick="doExp('video')">export video</button>
     <button id="expDat" class="btn-export hidden" onclick="doExp('data')">export data</button>
     <button id="rstBtn" class="btn-danger hidden" onclick="rstAll()">reset all</button>
+    <label id="cbTempLbl" class="hidden" title="Restrict navigation to top temporal clips"><input type="checkbox" id="cbTemp" onchange="onTemporalToggle()"> ⚡ temporal only</label>
   </div>
   <div class="actions hidden" id="progRow">
     <div class="pbar-wrap"><div class="pbar"><div class="pfill" id="pFill"></div></div>
@@ -948,12 +1553,17 @@ body{font-family:'IBM Plex Sans',system-ui,sans-serif;background:var(--bg);color
 <script>
 var S={frame:0,total:0,vw:0,vh:0,boxes:[],activeLabel:'',activeColor:'',
   instruments:[],tracked:null,fdCache:{},maskCache:{},tracking:false,playTimer:null,
-  allObjects:{},labelRects:[],bboxRanges:null,bboxRangesInFlight:false};
+  allObjects:{},labelRects:[],bboxRanges:null,bboxRangesInFlight:false,
+  temporalClips:null,temporalOnly:false,clickPoints:[],filteredFrames:null,filteredArray:null};
 var canvas=document.getElementById('canvas'),ctx=canvas.getContext('2d');
 var frameImg=null,maskImg=null,drag=null;
 
 fetch('/api/info').then(r=>r.json()).then(d=>{
   S.total=d.total_samples;S.vw=d.width;S.vh=d.height;S.instruments=d.instruments;
+  if(d.allowed_frames&&d.allowed_frames.length){
+    S.filteredFrames=new Set(d.allowed_frames);
+    S.filteredArray=d.allowed_frames.slice().sort((a,b)=>a-b);
+  }
   document.getElementById('iTotal').textContent=S.total;
   document.getElementById('iRes').textContent=d.width+'×'+d.height;
   document.getElementById('fpsPill').textContent=d.sample_fps+' FPS';
@@ -976,6 +1586,7 @@ fetch('/api/info').then(r=>r.json()).then(d=>{
   }
   var lf=(d.current_frame!=null)?d.current_frame:((d.has_tracked && d.tracked_start!=null)?d.tracked_start:0);
   loadFrame(lf);
+  fetchTemporalClips();
 });
 
 function selLbl(n,h){S.activeLabel=n;S.activeColor=h;
@@ -992,8 +1603,22 @@ function saveFrameDebounced(){
   _saveFrameTimer=setTimeout(()=>{fetch('/api/set_frame',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({frame:S.frame})});},400);
 }
+function nearestAllowed(n){
+  if(!S.filteredArray||!S.filteredArray.length)return n;
+  var arr=S.filteredArray;
+  /* binary search for insertion point */
+  var lo=0,hi=arr.length-1;
+  while(lo<hi){var mid=(lo+hi)>>1;if(arr[mid]<n)lo=mid+1;else hi=mid;}
+  if(arr[lo]===n)return n;
+  /* pick closer of arr[lo] and arr[lo-1] */
+  if(lo===0)return arr[0];
+  if(lo>=arr.length)return arr[arr.length-1];
+  return Math.abs(arr[lo]-n)<=Math.abs(arr[lo-1]-n)?arr[lo]:arr[lo-1];
+}
 async function loadFrame(n){
-  n=Math.max(0,Math.min(n,S.total-1));S.frame=n;
+  n=Math.max(0,Math.min(n,S.total-1));
+  n=nearestAllowed(n);
+  S.frame=n;
   saveFrameDebounced();
   document.getElementById('fIn').value=n;
   document.getElementById('iFrame').textContent=n;
@@ -1130,9 +1755,22 @@ canvas.addEventListener('mousemove',e=>{
 canvas.addEventListener('mouseup',e=>{
   if(!drag)return;
   if(drag.type==='draw'){var b=drag.box;
-    if(b&&(b[2]-b[0]>10)&&(b[3]-b[1]>10)){
+    var isDrag=b&&(b[2]-b[0]>8)&&(b[3]-b[1]>8);
+    if(isDrag){
+      S.clickPoints=[];
       S.boxes.push({x1:b[0],y1:b[1],x2:b[2],y2:b[3],label:S.activeLabel,color:S.activeColor,n_blobs:defaultNBlobs(S.activeLabel)});
-      updBoxList();}}
+      updBoxList();
+    } else {
+      /* single click — accumulate point for 4-point bbox mode */
+      S.clickPoints.push([drag.sx,drag.sy]);
+      if(S.clickPoints.length===4){
+        var xs=S.clickPoints.map(p=>p[0]),ys=S.clickPoints.map(p=>p[1]);
+        var cb=[Math.min(...xs),Math.min(...ys),Math.max(...xs),Math.max(...ys)];
+        S.clickPoints=[];
+        S.boxes.push({x1:cb[0],y1:cb[1],x2:cb[2],y2:cb[3],label:S.activeLabel,color:S.activeColor,n_blobs:defaultNBlobs(S.activeLabel)});
+        updBoxList();
+      }
+    }}
   else if(drag.box){S.fdCache[S.frame][drag.oid].bbox=drag.box;
     fetch('/api/update_bbox',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({sample:S.frame,oid:parseInt(drag.oid),bbox:drag.box.map(v=>Math.round(v))})});}
@@ -1152,6 +1790,23 @@ function redr(){
       drawTBox(box[0],box[1],box[2],box[3],rgb(o.color),o.label,o.color,oid);}}}
   S.boxes.forEach(b=>drawNBox(b.x1,b.y1,b.x2,b.y2,b.color,b.label));
   if(drag&&drag.type==='draw'&&drag.box){var db=drag.box;drawNBox(db[0],db[1],db[2],db[3],S.activeColor,S.activeLabel);}
+  if(S.clickPoints.length){
+    /* draw preview bbox from accumulated points */
+    var cxs=S.clickPoints.map(p=>p[0]),cys=S.clickPoints.map(p=>p[1]);
+    var px1=Math.min(...cxs),py1=Math.min(...cys),px2=Math.max(...cxs),py2=Math.max(...cys);
+    ctx.strokeStyle=S.activeColor||'#fff';ctx.lineWidth=2;ctx.setLineDash([6,4]);
+    ctx.strokeRect(px1,py1,px2-px1,py2-py1);ctx.setLineDash([]);
+    /* draw each point as numbered dot */
+    S.clickPoints.forEach(function(p,i){
+      ctx.beginPath();ctx.arc(p[0],p[1],6,0,2*Math.PI);
+      ctx.fillStyle=S.activeColor||'#fff';ctx.fill();
+      ctx.fillStyle='#000';ctx.font='bold 9px sans-serif';ctx.textAlign='center';ctx.textBaseline='middle';
+      ctx.fillText(i+1,p[0],p[1]);ctx.textAlign='left';ctx.textBaseline='alphabetic';
+    });
+    /* counter label */
+    ctx.font='bold 13px IBM Plex Sans,sans-serif';ctx.fillStyle=S.activeColor||'#fff';
+    ctx.fillText((4-S.clickPoints.length)+' more clicks',px1+4,py1>18?py1-6:py2+16);
+  }
 }
 function drawTBox(x1,y1,x2,y2,col,lbl,ca,oid){
   var dLbl='#'+oid+' '+lbl;
@@ -1173,6 +1828,58 @@ function drawNBox(x1,y1,x2,y2,col,lbl){
   ctx.fillText('⊕ '+lbl,x1+4,y1>22?y1-6:y2+16);
 }
 
+function fetchTemporalClips(){
+  fetch('/api/temporal_clips').then(r=>r.json()).then(d=>{
+    if(!d.clips||!d.clips.length){
+      /* clips not ready yet (background thread still computing) — retry */
+      setTimeout(fetchTemporalClips,2000);
+      return;
+    }
+    S.temporalClips=d.clips;
+    document.getElementById('cbTempLbl').classList.remove('hidden');
+    /* small pill in header */
+    var hdr=document.querySelector('.header');
+    if(!document.getElementById('tempPill')){
+      var p=document.createElement('span');
+      p.id='tempPill';p.className='pill pill-temp';
+      p.textContent='⚡ '+d.clips.length+' clips';
+      hdr.appendChild(p);
+    }
+    updTimeline();
+  }).catch(()=>setTimeout(fetchTemporalClips,2000));
+}
+function onTemporalToggle(){
+  S.temporalOnly=document.getElementById('cbTemp').checked;
+  if(S.temporalOnly&&S.temporalClips){
+    /* snap to nearest temporal clip if currently outside all clips */
+    var inClip=S.temporalClips.find(c=>S.frame>=c.start&&S.frame<=c.end);
+    if(!inClip&&S.temporalClips.length)loadFrame(S.temporalClips[0].start);
+  }
+}
+
+/* Returns the frame index after moving `delta` steps, respecting temporal clips when active. */
+function nextTemporalFrame(from,delta){
+  if(!S.temporalOnly||!S.temporalClips||!S.temporalClips.length)return from+delta;
+  var clips=S.temporalClips,dir=delta>0?1:-1,steps=Math.abs(delta),cur=from;
+  for(var step=0;step<steps;step++){
+    var ic=clips.find(c=>cur>=c.start&&cur<=c.end);
+    if(ic){
+      var next=cur+dir;
+      if(next>=ic.start&&next<=ic.end){cur=next;}
+      else if(dir>0){
+        var nc=clips.find(c=>c.start>ic.end);cur=nc?nc.start:ic.end;
+      }else{
+        var pc=null;for(var i=clips.length-1;i>=0;i--){if(clips[i].end<ic.start){pc=clips[i];break;}}
+        cur=pc?pc.end:ic.start;
+      }
+    }else{
+      if(dir>0){var nc2=clips.find(c=>c.start>cur);cur=nc2?nc2.start:(clips[clips.length-1]?clips[clips.length-1].end:cur);}
+      else{var pc2=null;for(var i=clips.length-1;i>=0;i--){if(clips[i].end<cur){pc2=clips[i];break;}}cur=pc2?pc2.end:(clips[0]?clips[0].start:cur);}
+    }
+  }
+  return Math.max(0,Math.min(cur,S.total-1));
+}
+
 function updBoxList(){
   var el=document.getElementById('boxList');
   if(!S.boxes.length){el.innerHTML='<span class="bempty">Select instrument → draw on frame</span>';return;}
@@ -1184,7 +1891,7 @@ function updBoxList(){
     '<button onclick="rmBox('+i+')">×</button></div>').join('');
 }
 function rmBox(i){S.boxes.splice(i,1);updBoxList();updUI();redr();}
-function clearDrawn(){S.boxes=[];updBoxList();updUI();redr();}
+function clearDrawn(){S.boxes=[];S.clickPoints=[];updBoxList();updUI();redr();}
 
 function updTrkList(){
   var trkEl=document.getElementById('trkList');
@@ -1220,8 +1927,10 @@ function updTrkList(){
       }
     }
     row+='<button onclick="delObj('+oid+')" title="Delete entire series">×</button></div>';
-    if(isOof)hOof+=row;
-    else if(hasMask)hTrk+=row;
+    var oofFrom=fd&&fd[oid]?fd[oid].oof_from:null;
+    var showOof=isOof&&oofFrom!=null&&(S.frame-oofFrom)<=3;
+    if(showOof)hOof+=row;
+    else if(!isOof&&hasMask)hTrk+=row;
   }
   trkEl.innerHTML=hTrk||'<span class="bempty">All objects out of frame</span>';
   oofEl.innerHTML=hOof;
@@ -1240,12 +1949,30 @@ function updUI(){
   if(ht)updTrkList();
 }
 
-function jmp(d){loadFrame(S.frame+d);}
+function nextFrame(from,delta){
+  /* Step through temporal clips, then skip any filtered-out frames. */
+  var n=nextTemporalFrame(from,delta);
+  if(!S.filteredFrames)return n;
+  var dir=delta>0?1:(delta<0?-1:0);
+  if(dir===0)return n;
+  var limit=S.total;
+  while(limit-->0&&!S.filteredFrames.has(n)){
+    var n2=nextTemporalFrame(n,dir);
+    if(n2===n)break; /* stuck at boundary */
+    n=n2;
+  }
+  return n;
+}
+function jmp(d){loadFrame(nextFrame(S.frame,d));}
 function goF(){loadFrame(+document.getElementById('fIn').value||0);}
 function togPlay(){
   if(S.playTimer){clearInterval(S.playTimer);S.playTimer=null;
     document.getElementById('playBtn').textContent='▶ play';return;}
-  S.playTimer=setInterval(()=>{if(S.frame>=S.total-1){togPlay();return;}loadFrame(S.frame+1);},1000);
+  S.playTimer=setInterval(()=>{
+    var nf=nextFrame(S.frame,1);
+    if(nf===S.frame||S.frame>=S.total-1){togPlay();return;}
+    loadFrame(nf);
+  },1000);
   document.getElementById('playBtn').textContent='⏸ stop';
 }
 function tlClk(e){var r=e.currentTarget.getBoundingClientRect();
@@ -1255,6 +1982,7 @@ document.addEventListener('keydown',e=>{
   var m={d:1,ArrowRight:1,a:-1,ArrowLeft:-1,w:10,ArrowUp:10,s:-10,ArrowDown:-10,q:-60,e:60};
   if(m[e.key]!==undefined){e.preventDefault();jmp(m[e.key]);}
   if(e.key===' '){e.preventDefault();togPlay();}
+  if(e.key==='Escape'){S.clickPoints=[];redr();}
 });
 
 async function startTrack(){
@@ -1302,6 +2030,19 @@ function updTimeline(){
   if(!lanesEl || !tl)return
 
   lanesEl.innerHTML=''
+
+  /* Paint temporal clip backgrounds first (always visible, even without tracks) */
+  if(S.temporalClips&&S.temporalClips.length&&S.total>0){
+    S.temporalClips.forEach(c=>{
+      var div=document.createElement('div');
+      div.className='tl-temporal';
+      div.style.left=((c.start/S.total)*100)+'%';
+      div.style.width=(((c.end-c.start+1)/S.total)*100)+'%';
+      div.title='Temporal clip '+c.start+'-'+c.end+' score='+c.score.toFixed(4);
+      lanesEl.appendChild(div);
+    });
+  }
+
   if(!S.tracked || !S.allObjects || !Object.keys(S.allObjects).length){
     tl.style.height='28px'
     return
@@ -1456,16 +2197,237 @@ var tt;function toast(m,e){var el=document.getElementById('toast');el.textConten
 """
 
 # ═══════════════════════════════════════════════════════════════
+#  VIDEO PICKER
+# ═══════════════════════════════════════════════════════════════
+
+_picker_cache: dict = {}  # video_stem -> computed info dict
+_picker_computing: set = set()  # stems currently being computed in background
+
+
+def _get_picker_video_paths() -> list[Path]:
+    """Return sorted list of video files in VIDEO_PICKER_DIR."""
+    if VIDEO_PICKER_DIR is None:
+        return []
+    vdir = Path(VIDEO_PICKER_DIR)
+    if not vdir.is_dir():
+        return []
+    exts = {'.mp4', '.mkv', '.avi', '.mov', '.webm'}
+    return sorted(p for p in vdir.iterdir() if p.suffix.lower() in exts)
+
+
+def _compute_picker_info(video_path: Path) -> dict:
+    """Compute completion stats for one video (may take a few seconds)."""
+    stem = video_path.stem
+    autosave_dir = EXPORT_DIR / "autosave" / _resolve_stem_in_dir(stem, EXPORT_DIR / "autosave")
+    state_json = autosave_dir / "state.json"
+    info = {
+        "path": str(video_path), "name": stem,
+        "started": False, "object_count": 0, "tracked_frames": 0,
+        "total_clips": 0, "annotated_clips": 0, "completion": 0.0,
+        "clips_ready": False,
+    }
+    bboxes = {}
+    if state_json.exists():
+        try:
+            with open(state_json) as f:
+                state = json.load(f)
+            objects = state.get("objects", {})
+            bboxes = state.get("bboxes", {})
+            info["started"] = bool(objects)
+            info["object_count"] = len(objects)
+            info["tracked_frames"] = len(bboxes)
+        except Exception as e:
+            print(f"[picker] Error reading {stem}: {e}")
+    feat_root = Path(FEATURES_ROOT) if FEATURES_ROOT is not None else _find_features_root(video_path)
+    if feat_root is None:
+        return info
+    try:
+        clips = compute_temporal_clips(
+            feat_root, stem,
+            clip_length=CLIP_LENGTH,
+            top_fraction=TEMPORAL_TOP_FRACTION,
+            max_frame=TEMPORAL_MAX_FRAME,
+            cache_dir=autosave_dir,
+        )
+        if clips:
+            bbox_frames = {int(k) for k in bboxes.keys()}
+            annotated = sum(
+                1 for c in clips
+                if any(c["start"] <= f <= c["end"] for f in bbox_frames)
+            )
+            info["total_clips"] = len(clips)
+            info["annotated_clips"] = annotated
+            info["completion"] = annotated / len(clips)
+            info["clips_ready"] = True
+    except Exception as e:
+        print(f"[picker] Temporal clip error for {stem}: {e}")
+    return info
+
+
+_LAST_VIDEO_FILE = EXPORT_DIR / "autosave" / "last_video.json"
+
+
+def _load_last_video() -> Path | None:
+    """Return the path of the last used video, or None if not set / missing."""
+    try:
+        if _LAST_VIDEO_FILE.exists():
+            with open(_LAST_VIDEO_FILE) as f:
+                d = json.load(f)
+            p = Path(d["path"])
+            return p if p.exists() else None
+    except Exception:
+        pass
+    return None
+
+
+def _save_last_video(path: Path):
+    """Persist the last used video path so it can be restored on next launch."""
+    try:
+        _LAST_VIDEO_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(_LAST_VIDEO_FILE, "w") as f:
+            json.dump({"path": str(path)}, f)
+    except Exception as e:
+        print(f"[picker] Could not save last video: {e}")
+
+
+PICKER_HTML = r"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Video Picker</title>
+<style>
+:root{--bg:#0c1017;--panel:#151c28;--border:#1e2a3a;--border-h:#2a3a50;--text:#c8d6e5;--dim:#5a6d82;--accent:#00b4d8;--green:#06d6a0;--red:#ef476f;--orange:#ffd166}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'IBM Plex Sans',system-ui,sans-serif;background:var(--bg);color:var(--text);min-height:100vh;padding:24px}
+.header{display:flex;align-items:center;gap:12px;border-bottom:1px solid var(--border);padding-bottom:12px;margin-bottom:20px}
+.header h1{font-family:monospace;font-size:15px;font-weight:600;color:var(--accent);letter-spacing:.5px}
+.header a{font-size:12px;color:var(--accent);text-decoration:none;margin-left:auto;padding:5px 12px;border:1px solid var(--border);border-radius:4px}
+.header a:hover{border-color:var(--accent)}
+.grid{display:flex;flex-direction:column;gap:6px}
+.card{background:var(--panel);border:1px solid var(--border);border-radius:6px;padding:12px 16px;cursor:pointer;transition:border-color .15s,background .15s;display:flex;align-items:center;gap:14px}
+.card:hover{border-color:var(--border-h);background:#1a2535}
+.card.current{border-color:var(--accent);cursor:default}
+.cur-arrow{color:var(--accent);font-size:16px;flex-shrink:0}
+.name{font-family:monospace;font-size:12px;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.badge{font-size:10px;padding:2px 8px;border-radius:99px;font-weight:600;flex-shrink:0;letter-spacing:.3px}
+.b-new{color:var(--dim);background:#1a2535;border:1px solid var(--border)}
+.b-started{color:var(--orange);background:#2a2010;border:1px solid #4a3820}
+.b-done{color:var(--green);background:#073b2e;border:1px solid #0a5c47}
+.b-current{color:var(--accent);background:#0a2030;border:1px solid var(--accent)}
+.prog-wrap{width:100px;background:#1a2535;border-radius:3px;height:5px;flex-shrink:0;overflow:hidden}
+.prog-bar{height:100%;background:var(--green);transition:width .4s}
+.pct{font-size:11px;color:var(--text);font-family:monospace;min-width:34px;text-align:right;flex-shrink:0}
+.clips-info{font-size:11px;color:var(--dim);font-family:monospace;min-width:70px;text-align:right;flex-shrink:0}
+.computing{font-size:11px;color:var(--dim);font-style:italic;flex-shrink:0}
+</style></head><body>
+<div class="header">
+  <h1>Video Picker</h1>
+  <a href="/">→ Tracker</a>
+</div>
+<div class="grid" id="grid">Loading…</div>
+<script>
+async function load() {
+  var r, data;
+  try { r = await fetch('/api/picker_videos'); data = await r.json(); } catch(e) { return; }
+  var videos = data.videos || [];
+  var g = document.getElementById('grid');
+  if (!videos.length) { g.textContent = 'No videos found. Set VIDEO_PICKER_DIR in the script config.'; return; }
+  var scrollY = window.scrollY;
+  g.innerHTML = '';
+  for (var i = 0; i < videos.length; i++) {
+    var v = videos[i];
+    var pct = v.clips_ready ? Math.round(v.completion * 100) : null;
+    var isDone = pct !== null && pct >= 90;
+    var badgeClass = v.current ? 'b-current' : (v.started ? (isDone ? 'b-done' : 'b-started') : 'b-new');
+    var badgeText = v.current ? 'current' : (v.started ? (isDone ? 'done' : 'started') : 'new');
+    var card = document.createElement('div');
+    card.className = 'card' + (v.current ? ' current' : '');
+    var html = '';
+    if (v.current) html += '<span class="cur-arrow">&#9658;</span>';
+    html += '<div class="name" title="' + v.name + '">' + v.name + '</div>';
+    html += '<span class="badge ' + badgeClass + '">' + badgeText + '</span>';
+    if (v.clips_ready) {
+      html += '<div class="prog-wrap"><div class="prog-bar" style="width:' + pct + '%"></div></div>';
+      html += '<div class="pct">' + pct + '%</div>';
+      html += '<div class="clips-info">' + v.annotated_clips + '/' + v.total_clips + ' clips</div>';
+    } else if (v.started) {
+      html += '<div class="clips-info">' + v.tracked_frames + ' frames tracked</div>';
+      html += '<div class="computing">computing clips…</div>';
+    } else {
+      html += '<div class="clips-info">—</div>';
+    }
+    card.innerHTML = html;
+    (function(vv, cc) {
+      if (!vv.current) {
+        cc.onclick = async function() {
+          cc.style.opacity = '0.5';
+          var resp = await fetch('/api/switch_video', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({path: vv.path})
+          });
+          var res = await resp.json();
+          if (res.ok) { window.location.href = '/'; }
+          else { alert('Switch failed: ' + (res.error || 'unknown')); cc.style.opacity = '1'; }
+        };
+      } else {
+        cc.onclick = function() { window.location.href = '/'; };
+      }
+    })(v, card);
+    g.appendChild(card);
+  }
+  window.scrollTo(0, scrollY);
+}
+load();
+setInterval(load, 4000);
+</script></body></html>"""
+
+
+# ═══════════════════════════════════════════════════════════════
 #  HTTP SERVER
 # ═══════════════════════════════════════════════════════════════
 class Handler(BaseHTTPRequestHandler):
-    video:   VideoReader  = None
-    tracker: SAM2Tracker  = None
+    video:           object       = None   # VideoReader or FrameReader
+    tracker:         SAM2Tracker  = None
+    temporal_clips:  list         = []
+    allowed_frames:  object       = None   # list[int] or None
+    _setup_gen:      int          = 0      # incremented on each video switch; stale threads abort
 
     def do_GET(self):
         p = self.path.split("?")[0]
         if p == "/":
-            self._send(200, "text/html", HTML_PAGE.encode())
+            if Handler.video is None:
+                self._send(200, "text/html", PICKER_HTML.encode())
+            else:
+                self._send(200, "text/html", HTML_PAGE.encode())
+        elif p == "/picker":
+            self._send(200, "text/html", PICKER_HTML.encode())
+        elif p == "/api/picker_videos":
+            videos = _get_picker_video_paths()
+            current_stem = Path(VIDEO_PATH).stem if VIDEO_PATH is not None else ""
+            result = []
+            for vp in videos:
+                stem = vp.stem
+                if stem in _picker_cache:
+                    info = dict(_picker_cache[stem])
+                else:
+                    info = {
+                        "path": str(vp), "name": stem,
+                        "started": (EXPORT_DIR / "autosave" / _resolve_stem_in_dir(stem, EXPORT_DIR / "autosave") / "state.json").exists(),
+                        "object_count": 0, "tracked_frames": 0,
+                        "total_clips": 0, "annotated_clips": 0,
+                        "completion": 0.0, "clips_ready": False,
+                    }
+                    if stem not in _picker_computing:
+                        _picker_computing.add(stem)
+                        def _bg(vp=vp):
+                            try:
+                                res = _compute_picker_info(vp)
+                                _picker_cache[vp.stem] = res
+                            finally:
+                                _picker_computing.discard(vp.stem)
+                        threading.Thread(target=_bg, daemon=True).start()
+                info["current"] = (stem == current_stem)
+                result.append(info)
+            self._json({"videos": result})
         elif p == "/api/info":
             s = self.tracker.state
             has_tracked = s.start is not None
@@ -1474,8 +2436,8 @@ class Handler(BaseHTTPRequestHandler):
                 "sample_fps": SAMPLE_FPS,
                 "step": self.video.step,
                 "orig_fps": self.video.orig_fps,
-                "width": self.video.width,
-                "height": self.video.height,
+                "width": DISPLAY_RESOLUTION[0] if DISPLAY_RESOLUTION else self.video.width,
+                "height": DISPLAY_RESOLUTION[1] if DISPLAY_RESOLUTION else self.video.height,
                 "sam2_ok": self.tracker.available,
                 "instruments": INSTRUMENTS,
                 "has_tracked": has_tracked,
@@ -1483,6 +2445,7 @@ class Handler(BaseHTTPRequestHandler):
                 "tracked_end": s.end,
                 "current_frame": s.current_frame,
                 "objects": {str(k): v for k, v in s.objects.items()} if has_tracked else {},
+                "allowed_frames": self.allowed_frames,
             })
         elif p.startswith("/api/frame/"):
             d = self.video.frame_jpeg(int(p.split("/")[-1]))
@@ -1503,6 +2466,8 @@ class Handler(BaseHTTPRequestHandler):
                 "progress": s.progress, "total": s.total,
                 "error": s.error, "start": s.start, "end": s.end,
                 "objects": {str(k): v for k, v in s.objects.items()}})
+        elif p == "/api/temporal_clips":
+            self._json({"clips": Handler.temporal_clips or []})
         else:
             self.send_error(404)
 
@@ -1514,14 +2479,16 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"ok": False, "error": "SAM2 not loaded"}, 503); return
             d = json.loads(body)
             self.tracker.start_tracking(self.video, int(d["frame"]),
-                d["boxes"], int(d.get("duration", TRACK_SECONDS)))
+                d["boxes"], int(d.get("duration", TRACK_SECONDS)),
+                clips=Handler.temporal_clips or None)
             self._json({"ok": True})
         elif p == "/api/extend_track":
             if not self.tracker.available:
                 self._json({"ok": False, "error": "SAM2 not loaded"}, 503); return
             d = json.loads(body)
             self.tracker.extend_object(self.video, int(d["oid"]),
-                int(d.get("duration", TRACK_SECONDS)))
+                int(d.get("duration", TRACK_SECONDS)),
+                clips=Handler.temporal_clips or None)
             self._json({"ok": True})
         elif p == "/api/update_bbox":
             d = json.loads(body)
@@ -1547,9 +2514,76 @@ class Handler(BaseHTTPRequestHandler):
             d = json.loads(body)
             ok = self.tracker.delete_object(int(d["oid"]))
             self._json({"ok": ok})
+        elif p == "/api/trim_object":
+            d = json.loads(body)
+            ok = self.tracker.trim_object_from(int(d["oid"]), int(d["from_frame"]))
+            self._json({"ok": ok})
         elif p == "/api/reset":
             self.tracker.reset()
             self._json({"ok": True})
+        elif p == "/api/switch_video":
+            d = json.loads(body)
+            vpath = Path(d["path"])
+            if not vpath.exists():
+                self._json({"ok": False, "error": "Video not found"}); return
+            try:
+                new_video = make_video_source(vpath, SAMPLE_FPS)
+                new_autosave_dir = EXPORT_DIR / "autosave" / _resolve_stem_in_dir(vpath.stem, EXPORT_DIR / "autosave")
+                Handler.tracker.reset_for_video(new_autosave_dir)
+                Handler.video = new_video
+                Handler.temporal_clips = []
+                global VIDEO_PATH
+                VIDEO_PATH = vpath
+                _save_last_video(vpath)
+
+                # Load caches — these are tiny JSON files, fast even on first hit
+                feat_root_cached  = _load_features_root_cache(new_autosave_dir)
+                allowed_cached    = _load_allowed_frames_cache(new_autosave_dir)
+
+                # Apply whatever we already know immediately
+                Handler.allowed_frames = allowed_cached if allowed_cached is not _CACHE_MISS else None
+
+                # Bump generation so any previous _bg_setup thread will abort
+                Handler._setup_gen += 1
+                my_gen = Handler._setup_gen
+
+                # Background: resolve any cache misses, then compute temporal clips.
+                # Checks generation at each step — exits immediately if a newer
+                # switch happened. Heavy HDD I/O also waits for tracking to finish.
+                def _bg_setup(vp=vpath, vid=new_video, adir=new_autosave_dir,
+                               frc=feat_root_cached, ac=allowed_cached, gen=my_gen):
+                    has_miss = frc is _CACHE_MISS or ac is _CACHE_MISS
+                    if has_miss:
+                        while Handler.tracker.state.running:
+                            if Handler._setup_gen != gen: return
+                            time.sleep(1)
+                    if Handler._setup_gen != gen: return
+                    feat_root = frc
+                    if frc is _CACHE_MISS:
+                        feat_root = Path(FEATURES_ROOT) if FEATURES_ROOT is not None \
+                                    else _find_features_root(vp)
+                        if Handler._setup_gen != gen: return
+                        _save_features_root_cache(adir, feat_root)
+                        print(f"[cache] features_root → {feat_root}")
+                    if ac is _CACHE_MISS:
+                        frames = _load_allowed_frames(FILTERED_FRAMES_ROOT, vid, vp.stem)
+                        if Handler._setup_gen != gen: return
+                        Handler.allowed_frames = frames
+                        _save_allowed_frames_cache(adir, frames)
+                        print(f"[cache] allowed_frames → {len(frames) if frames else 'none'}")
+                    if Handler._setup_gen != gen: return
+                    if feat_root is not None:
+                        Handler.temporal_clips = compute_temporal_clips(
+                            feat_root, vp.stem,
+                            clip_length=CLIP_LENGTH,
+                            top_fraction=TEMPORAL_TOP_FRACTION,
+                            max_frame=TEMPORAL_MAX_FRAME,
+                            cache_dir=adir,
+                        )
+                threading.Thread(target=_bg_setup, daemon=True).start()
+                self._json({"ok": True})
+            except Exception as e:
+                self._json({"ok": False, "error": str(e)})
         elif p == "/api/export":
             d = json.loads(body)
             EXPORT_DIR.mkdir(parents=True, exist_ok=True)
@@ -1584,31 +2618,38 @@ class Handler(BaseHTTPRequestHandler):
 #  MAIN
 # ═══════════════════════════════════════════════════════════════
 if __name__ == "__main__":
-    video = VideoReader(VIDEO_PATH, sample_fps=SAMPLE_FPS)
-
-    tracker = SAM2Tracker()
+    # Load SAM2 predictor upfront (this is slow — done once, reused across video switches)
+    _startup_autosave = EXPORT_DIR / "autosave" / "_no_video"
+    tracker = SAM2Tracker(autosave_dir=_startup_autosave)
     if not tracker.available:
         print("\n  ⚠  SAM2 NOT FOUND")
         print("  Install:  pip install sam2   # or:")
         print("            git clone https://github.com/facebookresearch/sam2.git ~/sam2")
         print("            cd ~/sam2 && pip install -e .\n")
 
-    # Autoload previous session
-    autoload_ok = tracker._autoload()
-    if autoload_ok:
-        print("[main] Restored previous tracking session")
+    # Restore last used video, or start with picker if none saved
+    video = None
+    _last_video = _load_last_video()
+    if _last_video is not None:
+        print(f"[main] Restoring last video: {_last_video.name}")
+        try:
+            video = make_video_source(_last_video, sample_fps=SAMPLE_FPS)
+            autosave_dir = EXPORT_DIR / "autosave" / _resolve_stem_in_dir(_last_video.stem, EXPORT_DIR / "autosave")
+            autoload_ok = tracker.reset_for_video(autosave_dir)
+            VIDEO_PATH = _last_video
+            if autoload_ok:
+                print("[main] Restored previous tracking session")
+        except Exception as e:
+            print(f"[main] Could not load last video: {e}")
+            video = None
+
+    if video is None:
+        print(f"[main] No video loaded — open http://localhost:{PORT} to pick one")
 
     if "--export-labeled" in sys.argv:
-        if not autoload_ok:
-            print(f"[main] No autosave session restored from: {AUTOSAVE_DIR / 'state.json'}")
-            if AUTOSAVE_DIR.exists():
-                try:
-                    names = sorted(p.name for p in AUTOSAVE_DIR.iterdir())
-                    print(f"[main] Autosave dir exists with files: {names}")
-                except Exception as e:
-                    print(f"[main] Could not list autosave dir: {e}")
-            else:
-                print(f"[main] Autosave dir does not exist: {AUTOSAVE_DIR}")
+        if video is None:
+            print("[main] --export-labeled requires a video to be loaded (select one via picker first)")
+            sys.exit(1)
         s = tracker.state
         print(f"[main] Export debug state: objects={len(s.objects)} mask_frames={len(s.masks)} bbox_frames={len(s.bboxes)} start={s.start} end={s.end}")
         out_path = EXPORT_DIR / "ALTR-20.mp4"
@@ -1616,25 +2657,64 @@ if __name__ == "__main__":
         print(f"[export] {'OK' if ok else 'FAIL'} → {out_path}")
         sys.exit(0)
 
+    # Resolve caches and spin up background thread if a video is loaded
+    Handler.temporal_clips = []
+    _startup_allowed = None
+    if video is not None:
+        _startup_autosave_dir = tracker.autosave_dir  # capture before Handler assignment
+        feat_root_cached  = _load_features_root_cache(_startup_autosave_dir)
+        allowed_cached    = _load_allowed_frames_cache(_startup_autosave_dir)
+        _startup_allowed  = allowed_cached if allowed_cached is not _CACHE_MISS else None
+
+        def _bg_startup(vp=_last_video, vid=video, adir=_startup_autosave_dir,
+                        frc=feat_root_cached, ac=allowed_cached):
+            has_miss = frc is _CACHE_MISS or ac is _CACHE_MISS
+            if has_miss:
+                while Handler.tracker is not None and Handler.tracker.state.running:
+                    time.sleep(1)
+            feat_root = frc
+            if frc is _CACHE_MISS:
+                feat_root = Path(FEATURES_ROOT) if FEATURES_ROOT is not None \
+                            else _find_features_root(vp)
+                _save_features_root_cache(adir, feat_root)
+                print(f"[cache] features_root → {feat_root}")
+            if ac is _CACHE_MISS:
+                frames = _load_allowed_frames(FILTERED_FRAMES_ROOT, vid, vp.stem)
+                Handler.allowed_frames = frames
+                _save_allowed_frames_cache(adir, frames)
+                print(f"[cache] allowed_frames → {len(frames) if frames else 'none'}")
+            if feat_root is not None:
+                clips = compute_temporal_clips(
+                    feat_root, vp.stem,
+                    clip_length=CLIP_LENGTH,
+                    top_fraction=TEMPORAL_TOP_FRACTION,
+                    max_frame=TEMPORAL_MAX_FRAME,
+                    cache_dir=adir,
+                )
+                Handler.temporal_clips = clips
+        threading.Thread(target=_bg_startup, daemon=True).start()
+
     Handler.video = video
     Handler.tracker = tracker
+    Handler.allowed_frames = _startup_allowed
     server = HTTPServer(("0.0.0.0", PORT), Handler)
     print(f"\n{'='*58}")
     print(f"   http://localhost:{PORT}")
     print(f"   ssh -L {PORT}:localhost:{PORT} user@host")
     print(f"{'='*58}")
-    print(f"\n   {video.total} samples @ {SAMPLE_FPS} fps — SAM2 box prompts")
-    print(f"   Autosave: {AUTOSAVE_DIR}\n")
-    print("  Features:")
-    print("  • Draw boxes + set blob count → track with SAM2")
-    print("  • Show masks AND bounding boxes (separate toggles)")
-    print("  • Edit tracked bboxes (drag/resize)")
-    print("  • Change instrument class via dropdown")
-    print("  • Mark objects out-of-frame per frame")
-    print("  • Delete entire object series")
-    print("  • Autosaves — restart to continue where you left off\n")
+    if video is not None:
+        print(f"\n   {video.total} samples @ {SAMPLE_FPS} fps — {_last_video.name}")
+        print(f"   Autosave: {tracker.autosave_dir}")
+    else:
+        print(f"\n   Open http://localhost:{PORT} to pick a video from {VIDEO_PICKER_DIR}")
+    print()
 
     try: server.serve_forever()
     except KeyboardInterrupt:
-        print("\nSaving…"); tracker._autosave()
-        print("Done."); video.close(); server.server_close()
+        print("\nSaving…")
+        if video is not None:
+            tracker._autosave()
+        print("Done.")
+        if video is not None:
+            video.close()
+        server.server_close()
