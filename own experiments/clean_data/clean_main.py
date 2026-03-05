@@ -12,8 +12,6 @@ from find_reference_for_cleanup import (
     plot_full_distribution,
     plot_filtered_distribution)
 
-from extract_features import load_model, extract_and_save_features
-
 from filter_images import (
     get_feature_paths,
     load_features,
@@ -26,25 +24,22 @@ from filter_images import (
 
 def main():
     # ===== CONFIGURATION =====
-    images_root = Path(r"/media/HDD1/moritz/foundential/Extracted Frames")
-    features_root = Path(r"/media/HDD1/moritz/foundential/Extracted Frames Features")
+    images_root = Path(r"/media/HDD1/moritz/foundential/Extracted Frames/test")
+    features_root = Path(r"/media/HDD1/moritz/Extracted Frames embeddings")
     reference_images_dir = images_root / "reference images"
     reference_features_dir = features_root / "reference images"
 
     exclude_folders = ["reference for filtering", "reference images"]
 
     # Temporal detection params
-    window_size = 2
+    window_size = 1
     min_gap = 1
-    max_display = 200
+    max_display = 300
 
     # Filter threshold
     filter_threshold = 0.36
     # =========================
 
-    # Load model once
-    print("Loading model...")
-    model, processor, device = load_model()
 
     loop_through = input("Loop through automatically after first run? (y/n): ").strip().lower() == 'y'
     first_run = True
@@ -67,6 +62,7 @@ def main():
             window_size=window_size,
             min_gap=min_gap,
             exclude_folders=exclude_folders,
+            images_root=images_root,
         )
 
         if len(all_scores) == 0:
@@ -88,80 +84,105 @@ def main():
 
         threshold = saved_threshold
 
-        filtered_changes = [c for c in all_changes if c.change_score >= threshold]
-        filtered_changes.sort(key=lambda x: x.change_score, reverse=False)
-
-        if not filtered_changes:
-            print(f"No changes found ≥ {threshold}. Dataset is clean!")
-            break
-
         if first_run:
-            plot_filtered_distribution(all_changes, threshold)
+            filtered_changes = []
+            while True:
+                filtered_changes = [c for c in all_changes if c.change_score >= threshold]
 
-        print(f"\n{len(filtered_changes)} changes ≥ {threshold}")
+                if not filtered_changes:
+                    print(f"No changes found ≥ {threshold}. Dataset is clean!")
+                    break
 
-        # Auto-save reference images
-        display_temporal_changes(
-            filtered_changes[:max_display],
-            features_root,
-            images_root,
-            global_mean,
-            global_std,
-            save_reference_images=True,
-            reference_images_dir=reference_images_dir,
-        )
+                plot_filtered_distribution(all_changes, threshold)
+                print(f"\n{len(filtered_changes)} changes ≥ {threshold}")
 
-        # ==================== STEP 2: Extract features for reference images ====================
+                ref_feature_paths = display_temporal_changes(
+                    filtered_changes[:max_display],
+                    features_root,
+                    images_root,
+                    global_mean,
+                    global_std,
+                )
+                print(f"Using {len(ref_feature_paths)} reference feature files from existing embeddings")
+
+                t = input(f"\nEnter new temporal threshold to retry (current={threshold}), or press Enter to proceed to step 2: ").strip()
+                if t:
+                    try:
+                        threshold = float(t)
+                        saved_threshold = threshold
+                    except ValueError:
+                        print("Invalid input, keeping current threshold.")
+                else:
+                    break
+
+            if not filtered_changes:
+                break
+        else:
+            filtered_changes = [c for c in all_changes if c.change_score >= threshold]
+
+            if not filtered_changes:
+                print(f"No changes found ≥ {threshold}. Dataset is clean!")
+                break
+
+            print(f"\n{len(filtered_changes)} changes ≥ {threshold}")
+
+            ref_feature_paths = display_temporal_changes(
+                filtered_changes[:max_display],
+                features_root,
+                images_root,
+                global_mean,
+                global_std,
+                show_viewer=False,
+            )
+            print(f"Using {len(ref_feature_paths)} reference feature files from existing embeddings")
+
+        # ==================== STEP 2: Filter dataset ====================
         print("\n" + "=" * 60)
-        print("STEP 2: EXTRACT FEATURES FOR REFERENCE IMAGES")
+        print("STEP 2: FILTER DATASET")
         print("=" * 60)
 
-        extract_and_save_features(
-            input_dir=reference_images_dir,
-            output_dir=reference_features_dir,
-            model=model,
-            processor=processor,
-            device=device,
-            batch_size=512,
-            skip_existing=True,
-        )
-
-        # ==================== STEP 3: Filter dataset ====================
-        print("\n" + "=" * 60)
-        print("STEP 3: FILTER DATASET")
-        print("=" * 60)
-
-        ref_feature_paths = get_feature_paths(reference_features_dir)
         ref_features, ref_feature_paths = load_features(ref_feature_paths)
 
-        target_feature_paths = get_feature_paths(features_root, exclude_folders=exclude_folders)
+        allowed_videos = {d.name for d in images_root.rglob("*") if d.is_dir()}
+        target_feature_paths = [p for p in get_feature_paths(features_root, exclude_folders=exclude_folders)
+                                 if p.parent.name in allowed_videos]
         target_features, target_feature_paths = load_features(target_feature_paths)
 
-        similar_results, min_distances = find_similar_images(
-            ref_features, target_features, target_feature_paths, filter_threshold
-        )
-
-        print(f"\nFound {len(similar_results)} images to filter")
-
         if first_run:
-            plot_distance_histogram(min_distances, filter_threshold)
-
-        if not similar_results:
-            print("No similar images found. Dataset is clean!")
-            break
-
-        if first_run:
-            # Display images to be deleted
-            if input(f"\nDisplay {len(similar_results)} images to be deleted? (y/n): ").strip().lower() == 'y':
-                display_similar_images(
-                    similar_results,
-                    ref_feature_paths,
-                    features_root=features_root,
-                    images_root=images_root,
-                    ref_features_root=features_root,
-                    ref_images_root=images_root,
-                    max_display=len(similar_results),
+            similar_results = []
+            while True:
+                similar_results, min_distances = find_similar_images(
+                    ref_features, target_features, target_feature_paths, filter_threshold
                 )
+                print(f"\nFound {len(similar_results)} images to filter")
+                plot_distance_histogram(min_distances, filter_threshold)
+
+                if not similar_results:
+                    print("No similar images found. Dataset is clean!")
+                    break
+
+                if input(f"\nDisplay {len(similar_results)} images to be deleted? (y/n): ").strip().lower() == 'y':
+                    display_similar_images(
+                        similar_results,
+                        ref_feature_paths,
+                        features_root=features_root,
+                        images_root=images_root,
+                        ref_features_root=features_root,
+                        ref_images_root=images_root,
+                        max_display=len(similar_results),
+                    )
+
+                t = input(f"\nEnter new filter threshold to retry (current={filter_threshold}), or press Enter to proceed: ").strip()
+                if t:
+                    try:
+                        filter_threshold = float(t)
+                    except ValueError:
+                        print("Invalid input, keeping current threshold.")
+                else:
+                    break
+
+            if not similar_results:
+                break
 
             # Delete
             if input(f"\n⚠️ DELETE {len(similar_results)} images? (yes/no): ").strip().lower() == 'yes':
@@ -171,6 +192,15 @@ def main():
             else:
                 break
         else:
+            similar_results, min_distances = find_similar_images(
+                ref_features, target_features, target_feature_paths, filter_threshold
+            )
+            print(f"\nFound {len(similar_results)} images to filter")
+
+            if not similar_results:
+                print("No similar images found. Dataset is clean!")
+                break
+
             # Auto mode - just delete
             delete_filtered_images(similar_results, features_root, images_root)
             print("\n🔄 Auto-looping to find more...\n")

@@ -47,26 +47,29 @@ def get_feature_paths_by_video(features_root: Path) -> dict[str, list[Path]]:
 
 
 def load_video_features(feature_paths: list[Path]) -> np.ndarray:
-    """Load all features for a single video."""
-    features = []
-    for path in feature_paths:
-        try:
-            feat = np.load(path)
-            features.append(feat)
-        except Exception as e:
-            print(f"Error loading {path}: {e}")
-            features.append(None)
+    """Load all features for a single video in parallel."""
+    from concurrent.futures import ThreadPoolExecutor
 
-    # Handle any failed loads by interpolating
+    def _load(path):
+        try:
+            return np.load(path)
+        except Exception:
+            return None
+
+    with ThreadPoolExecutor(max_workers=16) as ex:
+        features = list(ex.map(_load, feature_paths))
+
     valid_indices = [i for i, f in enumerate(features) if f is not None]
     if not valid_indices:
         return None
 
-    # Replace None with nearest valid feature
-    for i, f in enumerate(features):
-        if f is None:
-            nearest = min(valid_indices, key=lambda x: abs(x - i))
-            features[i] = features[nearest]
+    n_failed = len(features) - len(valid_indices)
+    if n_failed > 0:
+        print(f"  Warning: {n_failed}/{len(features)} feature files failed to load, filling with nearest")
+        for i, f in enumerate(features):
+            if f is None:
+                nearest = min(valid_indices, key=lambda x: abs(x - i))
+                features[i] = features[nearest]
 
     return np.vstack(features)
 
@@ -123,6 +126,7 @@ def find_all_temporal_changes(
         min_gap: int = 20,
         exclude_folders: list[str] | None = None,
         folder_filter: str | None = None,
+        images_root: Path | None = None,
 ) -> tuple[list[TemporalChange], np.ndarray, np.ndarray, np.ndarray]:
     """
     Find ALL temporal discontinuities across all videos.
@@ -141,6 +145,11 @@ def find_all_temporal_changes(
         - Global std embedding (across all frames)
     """
     videos = get_feature_paths_by_video(features_root)
+
+    if images_root is not None:
+        allowed = {d.name for d in images_root.rglob("*") if d.is_dir()}
+        videos = {name: paths for name, paths in videos.items() if name in allowed}
+        print(f"Restricting to {len(videos)} videos found in {images_root}")
 
     if exclude_folders:
         for folder in exclude_folders:
@@ -345,6 +354,7 @@ def display_temporal_changes(
         images_root: Path,
         global_mean: np.ndarray,
         global_std: np.ndarray,
+        show_viewer: bool = True,
         save_reference_images: bool = False,
         reference_images_dir: Path | None = None,
         n_context: int = 1,  # Ignored now, always shows 2 frames
@@ -359,116 +369,162 @@ def display_temporal_changes(
         reference_images_dir.mkdir(parents=True, exist_ok=True)
         print(f"Saving reference images to: {reference_images_dir}")
 
+    import json as _json
+    import urllib.parse
+    from http.server import HTTPServer, BaseHTTPRequestHandler
+
     # Sort by score ASCENDING (lowest first, starting from threshold)
     changes = sorted(changes, key=lambda x: x.change_score, reverse=False)
 
-    print(f"\nDisplaying {len(changes)} temporal changes (sorted by score, lowest first)...")
+    print(f"\nBuilding viewer for {len(changes)} temporal changes...")
 
     saved_count = 0
+    ref_feature_paths = []
+    pairs = []
 
-    for i, change in enumerate(changes):
+    for change in changes:
         pos = change.position
         paths = change.frame_paths
-        ws = change.window_size
 
-        # Always show just 2 frames: before (pos-1) and after (pos)
         frame_before_idx = pos - 1
         frame_after_idx = pos
 
         if frame_before_idx < 0 or frame_after_idx >= len(paths):
-            print(f"Skipping change at {pos}: out of bounds")
             continue
 
-        # Load embeddings for both frames
         try:
             emb_before = np.load(paths[frame_before_idx])
             emb_after = np.load(paths[frame_after_idx])
-        except Exception as e:
-            print(f"Error loading embeddings: {e}")
+        except Exception:
             continue
 
-        # Compute deviation from global mean (z-score magnitude)
-        # Higher = more unusual / more deviation from average
         z_before = (emb_before - global_mean) / (global_std + 1e-8)
-        z_after = (emb_after - global_mean) / (global_std + 1e-8)
+        z_after  = (emb_after  - global_mean) / (global_std + 1e-8)
+        dev_before = float(np.linalg.norm(z_before))
+        dev_after  = float(np.linalg.norm(z_after))
 
-        dev_before = np.linalg.norm(z_before)  # L2 norm of z-scores
-        dev_after = np.linalg.norm(z_after)
-
-        # Pick the one with higher deviation as reference
         if dev_before > dev_after:
-            chosen_idx = frame_before_idx
-            chosen_label = "BEFORE"
-            chosen_path = paths[frame_before_idx]
+            chosen_idx, chosen_label, chosen_path = frame_before_idx, "BEFORE", paths[frame_before_idx]
         else:
-            chosen_idx = frame_after_idx
-            chosen_label = "AFTER"
-            chosen_path = paths[frame_after_idx]
+            chosen_idx, chosen_label, chosen_path = frame_after_idx, "AFTER", paths[frame_after_idx]
 
-        # Get image paths
-        img_path_before = feature_path_to_image_path(paths[frame_before_idx], features_root, images_root)
-        img_path_after = feature_path_to_image_path(paths[frame_after_idx], features_root, images_root)
+        img_before = feature_path_to_image_path(paths[frame_before_idx], features_root, images_root)
+        img_after  = feature_path_to_image_path(paths[frame_after_idx],  features_root, images_root)
         chosen_img_path = feature_path_to_image_path(chosen_path, features_root, images_root)
 
-        # Save reference image if enabled
+        ref_feature_paths.append(chosen_path)
+
         if save_reference_images and reference_images_dir and chosen_img_path and chosen_img_path.exists():
-            # Create unique filename: video_name_frame_idx_score.ext
             save_name = f"{change.video_name}_frame{chosen_idx}_score{change.change_score:.4f}{chosen_img_path.suffix}"
-            save_path = reference_images_dir / save_name
-            shutil.copy(chosen_img_path, save_path)
+            shutil.copy(chosen_img_path, reference_images_dir / save_name)
             saved_count += 1
 
-        # Create figure with 2 frames
-        fig, axes = plt.subplots(1, 2, figsize=(10, 5))
-
-        # Frame before
-        try:
-            img_before = Image.open(img_path_before)
-            axes[0].imshow(img_before)
-        except:
-            axes[0].text(0.5, 0.5, "Not found", ha="center", va="center")
-
-        is_chosen_before = (chosen_idx == frame_before_idx)
-        title_before = f"BEFORE (Frame {frame_before_idx})\nGlobal Dev: {dev_before:.2f}"
-        if is_chosen_before:
-            title_before += "\n✓ CHOSEN AS REFERENCE"
-            for spine in axes[0].spines.values():
-                spine.set_edgecolor("green")
-                spine.set_linewidth(4)
-        axes[0].set_title(title_before, fontsize=10, fontweight="bold" if is_chosen_before else "normal",
-                         color="green" if is_chosen_before else "black")
-        axes[0].axis("off")
-
-        # Frame after
-        try:
-            img_after = Image.open(img_path_after)
-            axes[1].imshow(img_after)
-        except:
-            axes[1].text(0.5, 0.5, "Not found", ha="center", va="center")
-
-        is_chosen_after = (chosen_idx == frame_after_idx)
-        title_after = f"AFTER (Frame {frame_after_idx})\nGlobal Dev: {dev_after:.2f}"
-        if is_chosen_after:
-            title_after += "\n✓ CHOSEN AS REFERENCE"
-            for spine in axes[1].spines.values():
-                spine.set_edgecolor("green")
-                spine.set_linewidth(4)
-        axes[1].set_title(title_after, fontsize=10, fontweight="bold" if is_chosen_after else "normal",
-                         color="green" if is_chosen_after else "black")
-        axes[1].axis("off")
-
-        plt.suptitle(
-            f"#{i + 1}/{len(changes)}: {change.video_name[:50]}\nChange Score: {change.change_score:.4f} | Reference: {chosen_label} frame",
-            fontsize=11,
-            fontweight="bold"
-        )
-
-        plt.tight_layout()
-        plt.show()
-        plt.close(fig)
+        pairs.append({
+            "before": str(img_before) if img_before and img_before.exists() else "",
+            "after":  str(img_after)  if img_after  and img_after.exists()  else "",
+            "score":  round(change.change_score, 4),
+            "video":  change.video_name,
+            "chosen": chosen_label,
+            "dev_before": round(dev_before, 2),
+            "dev_after":  round(dev_after, 2),
+        })
 
     if save_reference_images:
-        print(f"\nSaved {saved_count} reference images to: {reference_images_dir}")
+        print(f"Saved {saved_count} reference images to: {reference_images_dir}")
+
+    pairs_json = _json.dumps(pairs)
+    html = f"""<!DOCTYPE html><html><head><meta charset="utf-8">
+<title>Temporal changes</title>
+<style>
+  *{{box-sizing:border-box;margin:0;padding:0}}
+  body{{background:#111;color:#eee;font-family:sans-serif;height:100vh;display:flex;flex-direction:column}}
+  #bar{{padding:10px 16px;background:#1a1a1a;display:flex;align-items:center;gap:16px;flex-shrink:0;flex-wrap:wrap}}
+  #counter{{font-weight:bold;font-size:1.1em}}
+  #score{{color:#f90;font-size:.95em}}
+  #video{{color:#666;font-size:.8em;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:40%}}
+  #hint{{font-size:.8em;color:#555;margin-left:auto}}
+  #imgs{{flex:1;display:flex;gap:8px;padding:8px;min-height:0}}
+  .slot{{flex:1;display:flex;flex-direction:column;min-height:0}}
+  .lbl{{font-size:.75em;color:#888;padding:2px 0 4px}}
+  .lbl span{{color:#4f4;font-weight:bold}}
+  .slot img{{flex:1;object-fit:contain;width:100%;min-height:0;border-radius:4px;background:#222}}
+  .chosen img{{outline:3px solid #4f4;border-radius:4px}}
+  .missing{{flex:1;display:flex;align-items:center;justify-content:center;color:#555;font-size:.9em;background:#1a1a1a;border-radius:4px}}
+</style></head><body>
+<div id="bar">
+  <span id="counter"></span>
+  <span id="score"></span>
+  <span id="video"></span>
+  <span id="hint">a / ← &nbsp;&nbsp; d / →</span>
+</div>
+<div id="imgs">
+  <div class="slot" id="slotB"><div class="lbl" id="lblB">BEFORE</div><img id="imgB"></div>
+  <div class="slot" id="slotA"><div class="lbl" id="lblA">AFTER</div><img id="imgA"></div>
+</div>
+<script>
+var pairs={pairs_json};
+var i=0;
+function show(){{
+  var p=pairs[i];
+  document.getElementById('counter').textContent=(i+1)+'/'+pairs.length;
+  document.getElementById('score').textContent='score='+p.score;
+  document.getElementById('video').textContent=p.video;
+  function setSlotImg(imgId, path, idx, suffix){{
+    var el=document.getElementById(imgId);
+    var slot=el.parentElement;
+    var old=slot.querySelector('.missing');if(old)old.remove();
+    if(path){{el.style.display='';el.src='/img?p='+encodeURIComponent(path)+'&i='+idx+suffix;}}
+    else{{el.style.display='none';var d=document.createElement('div');d.className='missing';d.textContent='not found: '+path;slot.appendChild(d);}}
+  }}
+  setSlotImg('imgB',p.before,i,'b');
+  setSlotImg('imgA',p.after,i,'a');
+  var chB=p.chosen==='BEFORE';
+  document.getElementById('slotB').className='slot'+(chB?' chosen':'');
+  document.getElementById('slotA').className='slot'+(!chB?' chosen':'');
+  document.getElementById('lblB').innerHTML='BEFORE &mdash; dev='+p.dev_before+(chB?' <span>✓ reference</span>':'');
+  document.getElementById('lblA').innerHTML='AFTER &mdash; dev='+p.dev_after+(!chB?' <span>✓ reference</span>':'');
+}}
+document.addEventListener('keydown',function(e){{
+  if(e.key==='d'||e.key==='ArrowRight'){{if(i<pairs.length-1){{i++;show();}}}}
+  else if(e.key==='a'||e.key==='ArrowLeft'){{if(i>0){{i--;show();}}}}
+}});
+show();
+</script>
+</body></html>"""
+
+    if show_viewer:
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *a): pass
+            def do_GET(self):
+                if self.path == "/":
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/html; charset=utf-8")
+                    self.end_headers()
+                    self.wfile.write(html.encode())
+                elif self.path.startswith("/img?p="):
+                    p = Path(urllib.parse.unquote(self.path[7:].split("&")[0]))
+                    if p.exists():
+                        self.send_response(200)
+                        self.send_header("Content-Type", "image/jpeg")
+                        self.end_headers()
+                        self.wfile.write(p.read_bytes())
+                    else:
+                        self.send_error(404)
+                else:
+                    self.send_error(404)
+
+        server = HTTPServer(("0.0.0.0", 8767), Handler)
+        print(f"\nViewer running at  http://localhost:8767")
+        print(f"SSH tunnel:        ssh -L 8767:localhost:8767 user@host")
+        print("Press Ctrl+C to continue.\n")
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            server.server_close()
+
+    return ref_feature_paths
 
 
 def main():

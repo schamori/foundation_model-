@@ -23,7 +23,7 @@ Install SAM2:
 import multiprocessing as mp
 mp.set_start_method("spawn", force=True)
 
-import os, sys, json, re, shutil, subprocess, threading, traceback, time, bisect
+import os, sys, json, re, shutil, subprocess, threading, traceback, time
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -315,6 +315,7 @@ _FEAT_KEYWORDS = {"feature", "features", "embed", "embeddings", "emb", "feat"}
 
 
 _PREFIX_MATCH_PREFIXES = ("RS", "TL")  # only stems starting with these use prefix matching
+_TRAILING_NUM_RE = re.compile(r'(\d+)$')
 
 def _prefix_key(stem: str) -> str:
     """Return the short ID prefix used for fuzzy matching.
@@ -326,9 +327,23 @@ def _prefix_key(stem: str) -> str:
     return stem
 
 
+def _trailing_digits(stem: str) -> str | None:
+    """Return the trailing digit sequence of stem, or None.
+    'Aneurysm_21905025' → '21905025',  'frame_000042' → '000042'."""
+    m = _TRAILING_NUM_RE.search(stem)
+    return m.group(1) if m else None
+
+
 def _match_stem(stem: str, candidates) -> str:
     """Return the best match for stem among a collection of names.
-    Priority: exact match > any name that starts with _prefix_key(stem) > original stem."""
+
+    Priority:
+      1. Exact match
+      2. Starts-with prefix key  (RS-034, TL-052, …)
+      3. Trailing-digits exact   'Aneurysm_21905025' ↔ 'MCA_..._21905025'
+      4. Digit-ID substring      'Aneurysm_21144934' ↔ 'MCA_..._21144934_Volume_3_Video_1'
+         (only for digit sequences ≥ 4 chars, matched as whole numbers)
+    """
     cands = list(candidates)
     if stem in cands:
         return stem
@@ -336,6 +351,18 @@ def _match_stem(stem: str, candidates) -> str:
     for c in sorted(cands):
         if c.startswith(prefix):
             return c
+    td = _trailing_digits(stem)
+    if td:
+        # Priority 3: candidate also ends with same digits
+        for c in sorted(cands):
+            if _trailing_digits(c) == td:
+                return c
+        # Priority 4: digit-ID appears anywhere in candidate (as a whole number)
+        if len(td) >= 4:
+            td_re = re.compile(r'(?<!\d)' + re.escape(td) + r'(?!\d)')
+            for c in sorted(cands):
+                if td_re.search(c):
+                    return c
     return stem
 
 
@@ -365,14 +392,21 @@ def _load_allowed_frames(filtered_root: Path | None, video, video_name: str | No
         video_name = VIDEO_PATH.stem
     folder = filtered_root / _resolve_stem_in_dir(video_name, filtered_root)
     if not folder.is_dir():
-        # Search recursively — try exact name then prefix match at each level
+        # Search recursively — try exact name, prefix, or digit-ID match
         prefix = _prefix_key(video_name)
+        td = _trailing_digits(video_name)
+        td_re = re.compile(r'(?<!\d)' + re.escape(td) + r'(?!\d)') if td and len(td) >= 4 else None
         matches = [
             m for m in filtered_root.rglob("*")
-            if m.is_dir() and (m.name == video_name or m.name.startswith(prefix))
+            if m.is_dir() and (
+                m.name == video_name
+                or m.name.startswith(prefix)
+                or (_trailing_digits(m.name) == td if td else False)
+                or (td_re.search(m.name) if td_re else False)
+            )
         ]
         if matches:
-            # prefer exact, otherwise first prefix hit
+            # prefer exact, otherwise first prefix/digit-ID hit
             exact = [m for m in matches if m.name == video_name]
             folder = (exact or matches)[0]
             print(f"[filter] Found folder: {folder}")
@@ -382,14 +416,19 @@ def _load_allowed_frames(filtered_root: Path | None, video, video_name: str | No
 
     present_stems = {p.stem for p in folder.iterdir() if p.suffix.lower() in _IMG_EXTS}
     if not present_stems:
-        # Folder matched by name/prefix but contains no images directly —
+        # Folder matched but contains no images directly —
         # search one level deeper (e.g. test/MVD/ → test/MVD/RS-034_.../)
         prefix = _prefix_key(video_name)
+        td = _trailing_digits(video_name)
+        td_re = re.compile(r'(?<!\d)' + re.escape(td) + r'(?!\d)') if td and len(td) >= 4 else None
         deeper = None
         for sub in sorted(folder.iterdir()):
             if not sub.is_dir():
                 continue
-            if sub.name == video_name or sub.name.startswith(prefix):
+            sub_td = _trailing_digits(sub.name)
+            if (sub.name == video_name or sub.name.startswith(prefix)
+                    or (td and sub_td == td)
+                    or (td_re and td_re.search(sub.name))):
                 stems = {p.stem for p in sub.iterdir() if p.suffix.lower() in _IMG_EXTS}
                 if stems:
                     deeper = sub
@@ -512,7 +551,15 @@ def _load_video_embeddings(features_root: Path, video_name: str):
     return (np.vstack(feats) if feats else None), stem_nums
 
 
-def _load_clips_cache(cache_dir: Path, clip_length: int, top_fraction: float, max_frame) -> list | None:
+def _allowed_hash(allowed_frames) -> int | None:
+    """Compact fingerprint of allowed_frames list for cache invalidation."""
+    if allowed_frames is None:
+        return None
+    return hash((len(allowed_frames), tuple(allowed_frames[:5] + allowed_frames[-5:])))
+
+
+def _load_clips_cache(cache_dir: Path, clip_length: int, top_fraction: float, max_frame,
+                      allowed_frames=None) -> list | None:
     """Load cached temporal clips if params match, else return None."""
     p = cache_dir / "temporal_clips.json"
     if not p.exists():
@@ -522,7 +569,8 @@ def _load_clips_cache(cache_dir: Path, clip_length: int, top_fraction: float, ma
             d = json.load(f)
         if (d.get("clip_length") == clip_length
                 and d.get("top_fraction") == top_fraction
-                and d.get("max_frame") == max_frame):
+                and d.get("max_frame") == max_frame
+                and d.get("allowed_hash") == _allowed_hash(allowed_frames)):
             clips = d.get("clips", [])
             print(f"[temporal] Loaded {len(clips)} clips from cache")
             return clips
@@ -531,13 +579,15 @@ def _load_clips_cache(cache_dir: Path, clip_length: int, top_fraction: float, ma
     return None
 
 
-def _save_clips_cache(cache_dir: Path, clips: list, clip_length: int, top_fraction: float, max_frame):
+def _save_clips_cache(cache_dir: Path, clips: list, clip_length: int, top_fraction: float,
+                      max_frame, allowed_frames=None):
     """Persist temporal clips to disk so they survive restarts."""
     try:
         cache_dir.mkdir(parents=True, exist_ok=True)
         with open(cache_dir / "temporal_clips.json", "w") as f:
             json.dump({"clip_length": clip_length, "top_fraction": top_fraction,
-                       "max_frame": max_frame, "clips": clips}, f)
+                       "max_frame": max_frame, "allowed_hash": _allowed_hash(allowed_frames),
+                       "clips": clips}, f)
         print(f"[temporal] Saved {len(clips)} clips to cache → {cache_dir.name}")
     except Exception as e:
         print(f"[temporal] Cache save error: {e}")
@@ -602,11 +652,16 @@ def compute_temporal_clips(
         top_fraction: float = 0.20,
         max_frame: int | None = None,
         cache_dir: Path | None = None,
+        allowed_frames: list | None = None,
 ) -> list:
     """
     Divide the embedding sequence into non-overlapping clips, compute a mean
     embedding per clip, then use greedy max-min diversity (L2) selection to
     pick the most spread-out top_fraction of clips.
+
+    If allowed_frames is provided, only embeddings whose stem number is in
+    that set are used — clips are built exclusively from "good" filtered
+    frames.
 
     Selection rule:
       1. Start with the clip whose mean is furthest from the global mean.
@@ -620,18 +675,34 @@ def compute_temporal_clips(
     where score = L2 distance from global mean (for debug display).
     """
     if cache_dir is not None:
-        cached = _load_clips_cache(cache_dir, clip_length, top_fraction, max_frame)
+        cached = _load_clips_cache(cache_dir, clip_length, top_fraction, max_frame, allowed_frames)
         if cached is not None:
             return cached
 
-    features, stem_nums = _load_video_embeddings(features_root, video_name)
+    result = _load_video_embeddings(features_root, video_name)
+    if result is None:
+        return []
+    features, stem_nums = result
     if features is None:
         return []
     n = len(features)
     if max_frame is not None:
         n = min(n, max_frame)
+        features = features[:n]
         stem_nums = stem_nums[:n]
         print(f"[temporal] Capped at frame {max_frame} ({n} frames used)")
+
+    # Filter to allowed frames only (skip "bad" frames removed by cleanup)
+    if allowed_frames is not None:
+        allowed_set = set(allowed_frames)
+        keep = [i for i in range(n) if stem_nums[i] in allowed_set]
+        if not keep:
+            print(f"[temporal] No embeddings match allowed_frames — skipping clip computation")
+            return []
+        features = features[keep]
+        stem_nums = [stem_nums[i] for i in keep]
+        n = len(features)
+        print(f"[temporal] Filtered to {n} allowed frames (from {len(allowed_set)} allowed)")
 
     # Build per-clip mean embeddings; start/end are stem frame numbers
     clips, means = [], []
@@ -692,7 +763,7 @@ def compute_temporal_clips(
               f"dist={dists_to_global[i]:.4f}{marker}")
 
     if cache_dir is not None:
-        _save_clips_cache(cache_dir, top, clip_length, top_fraction, max_frame)
+        _save_clips_cache(cache_dir, top, clip_length, top_fraction, max_frame, allowed_frames)
     return top
 
 
@@ -702,45 +773,44 @@ def compute_temporal_clips(
 def _cap_duration_to_clip(video, start_sample: int, duration: int, clips: list) -> int:
     """Cap tracking duration so it doesn't enter a non-selected region.
 
-    Starts in the clip containing start_sample, then extends the allowed range
-    through any consecutive selected clips (i.e. clips whose start frame is
-    reachable by the next video sample after the current boundary).  Only stops
-    where there is a genuine gap into unselected territory.
+    Clip start/end values are sequential 1-fps sample indices (stem numbers
+    from embedding filenames like frame_000042.npy → 42), equal to the video
+    sample index regardless of the video's original fps or step size.
+    All comparisons therefore use start_sample directly.
 
+    Extends coverage through consecutive selected clips (no gap between them).
     Returns duration unchanged if start_sample is not inside any clip."""
     if not clips or start_sample >= video.total:
         return duration
-    orig_frame = video.sample_map[start_sample]
 
     # Find the clip containing start_sample
     coverage_end = None
     for clip in clips:
-        if clip["start"] <= orig_frame <= clip["end"]:
+        if clip["start"] <= start_sample <= clip["end"]:
             coverage_end = clip["end"]
             break
     if coverage_end is None:
         return duration  # not inside any selected clip — no restriction
 
-    # Walk forward: if the very next video sample after coverage_end falls
-    # inside another selected clip, absorb that clip and keep going.
+    # Walk forward: if the sample right after coverage_end falls inside
+    # another selected clip, absorb that clip and keep going.
     changed = True
     while changed:
         changed = False
-        next_idx = bisect.bisect_right(video.sample_map, coverage_end)
-        if next_idx >= len(video.sample_map):
+        next_sample = coverage_end + 1
+        if next_sample >= video.total:
             break
-        next_frame = video.sample_map[next_idx]
         for clip in clips:
-            if clip["start"] <= next_frame <= clip["end"]:
+            if clip["start"] <= next_sample <= clip["end"]:
                 coverage_end = clip["end"]
                 changed = True
                 break
 
-    last_in_coverage = bisect.bisect_right(video.sample_map, coverage_end) - 1
+    last_in_coverage = min(coverage_end, video.total - 1)
     max_frames = max(1, last_in_coverage - start_sample + 1)
     capped = min(duration, max_frames)
     if capped < duration:
-        print(f"[clips] capped duration {duration}→{capped} (coverage ends at frame {coverage_end})")
+        print(f"[clips] capped duration {duration}→{capped} (coverage ends at sample {coverage_end})")
     return capped
 
 
@@ -777,6 +847,7 @@ class TrackerState:
         self.bboxes   = {}   # sample_idx → {oid: [x1,y1,x2,y2] or None}
         self.objects   = {}   # oid → {"label","box","n_blobs"}
         self.oof       = {}     # {oid: frame_from} — OOF from that frame onwards
+        self.review_marks = set()  # set of sample indices marked for review
         self.current_frame = 0
         self.start = self.end = None
         self.running = False
@@ -1202,6 +1273,7 @@ class SAM2Tracker:
                     "objects": {str(k): v for k, v in s.objects.items()},
                     "bboxes": bboxes_ser,
                     "oof": oof_ser,
+                    "review_marks": sorted(s.review_marks),
                     "start": s.start, "end": s.end,
                     "current_frame": s.current_frame,
                 }
@@ -1245,6 +1317,7 @@ class SAM2Tracker:
             else:
                 # New format: {oid: frame_from}
                 s.oof = {int(oid): frame_from for oid, frame_from in oof_data.items()}
+            s.review_marks = set(data.get("review_marks", []))
             mask_path = self.autosave_dir / "masks.npz"
             if mask_path.exists():
                 npz = np.load(mask_path)
@@ -1254,7 +1327,8 @@ class SAM2Tracker:
                     oid = int(parts[1])
                     if si not in s.masks: s.masks[si] = {}
                     s.masks[si][oid] = npz[key]
-            print(f"[autoload] Restored {len(s.objects)} objects, {len(s.bboxes)} frames")
+            print(f"[autoload] Restored {len(s.objects)} objects, {len(s.bboxes)} frames"
+                  f"{f', {len(s.review_marks)} review marks' if s.review_marks else ''}")
             return True
         except Exception as e:
             print(f"[autoload] Error: {e}")
@@ -1473,6 +1547,9 @@ body{font-family:'IBM Plex Sans',system-ui,sans-serif;background:var(--bg);color
 .pfill{height:100%;width:0;border-radius:99px;background:linear-gradient(90deg,#0077b6,var(--accent));transition:width .3s}
 .ptxt{font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--dim);white-space:nowrap}
 .timeline{height:28px;background:var(--panel);border:1px solid var(--border);border-radius:5px;position:relative;cursor:pointer;overflow:hidden}
+.tl-review{position:absolute;top:0;bottom:0;width:3px;background:#ff3333;z-index:5;pointer-events:none;border-radius:1px;box-shadow:0 0 4px #ff3333,0 0 8px rgba(255,51,51,.5)}
+.review-active{background:#ff3333!important;border-color:#ff3333!important;color:#fff!important;animation:reviewPulse 1.2s ease-in-out infinite}
+@keyframes reviewPulse{0%,100%{box-shadow:0 0 4px #ff3333}50%{box-shadow:0 0 12px #ff3333,0 0 20px rgba(255,51,51,.4)}}
 .tl-lanes{position:absolute;inset:0}
 .tl-lane{position:absolute;left:0;right:0}
 .tl-seg{position:absolute;top:2px;bottom:2px;border-radius:4px;opacity:.45}
@@ -1510,7 +1587,8 @@ body{font-family:'IBM Plex Sans',system-ui,sans-serif;background:var(--bg);color
     <button onclick="jmp(60)">+60s</button>
     <span style="width:12px"></span>
     <button id="playBtn" onclick="togPlay()">▶ play</button>
-    <span class="shortcuts">A/D ±1 · W/S ±10 · Q/E ±60 · Space=play</span>
+    <button id="reviewBtn" onclick="toggleReviewMark()" style="background:#2a1a1a;border-color:#5c2020;color:#ff6666;font-weight:700">⚑ Mark review</button>
+    <span class="shortcuts">A/D ±1 · W/S ±10 · Q/E ±60 · Space=play · R=review</span>
   </div>
   <div class="main-area">
     <div class="canvas-wrap"><canvas id="canvas" width="800" height="450"></canvas></div>
@@ -1554,7 +1632,8 @@ body{font-family:'IBM Plex Sans',system-ui,sans-serif;background:var(--bg);color
 var S={frame:0,total:0,vw:0,vh:0,boxes:[],activeLabel:'',activeColor:'',
   instruments:[],tracked:null,fdCache:{},maskCache:{},tracking:false,playTimer:null,
   allObjects:{},labelRects:[],bboxRanges:null,bboxRangesInFlight:false,
-  temporalClips:null,temporalOnly:false,clickPoints:[],filteredFrames:null,filteredArray:null};
+  temporalClips:null,temporalOnly:false,clickPoints:[],filteredFrames:null,filteredArray:null,
+  reviewMarks:new Set()};
 var canvas=document.getElementById('canvas'),ctx=canvas.getContext('2d');
 var frameImg=null,maskImg=null,drag=null;
 
@@ -1563,6 +1642,9 @@ fetch('/api/info').then(r=>r.json()).then(d=>{
   if(d.allowed_frames&&d.allowed_frames.length){
     S.filteredFrames=new Set(d.allowed_frames);
     S.filteredArray=d.allowed_frames.slice().sort((a,b)=>a-b);
+  }
+  if(d.review_marks&&d.review_marks.length){
+    S.reviewMarks=new Set(d.review_marks);
   }
   document.getElementById('iTotal').textContent=S.total;
   document.getElementById('iRes').textContent=d.width+'×'+d.height;
@@ -1624,6 +1706,7 @@ async function loadFrame(n){
   document.getElementById('iFrame').textContent=n;
   document.getElementById('iTime').textContent=n+'s';
   document.getElementById('tlCur').style.left=(S.total>1?(n/(S.total-1))*100:0)+'%';
+  updReviewBtn();
   var myId=++_loadId;
   var framePromise=loadImg('/api/frame/'+n+'?t='+Date.now());
   var fdPromise=Promise.resolve(S.fdCache[n]);
@@ -1982,8 +2065,27 @@ document.addEventListener('keydown',e=>{
   var m={d:1,ArrowRight:1,a:-1,ArrowLeft:-1,w:10,ArrowUp:10,s:-10,ArrowDown:-10,q:-60,e:60};
   if(m[e.key]!==undefined){e.preventDefault();jmp(m[e.key]);}
   if(e.key===' '){e.preventDefault();togPlay();}
+  if(e.key==='r'||e.key==='R'){e.preventDefault();toggleReviewMark();}
   if(e.key==='Escape'){S.clickPoints=[];redr();}
 });
+
+async function toggleReviewMark(){
+  var r=await fetch('/api/toggle_review',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({frame:S.frame})});
+  var d=await r.json();
+  if(d.ok){
+    S.reviewMarks=new Set(d.review_marks);
+    updTimeline();updReviewBtn();
+    toast(d.marked?'⚑ Marked frame '+S.frame+' for review':'Unmarked frame '+S.frame);
+  }
+}
+function updReviewBtn(){
+  var btn=document.getElementById('reviewBtn');
+  if(!btn)return;
+  var marked=S.reviewMarks.has(S.frame);
+  btn.textContent=marked?'⚑ MARKED':'⚑ Mark review';
+  btn.classList.toggle('review-active',marked);
+}
 
 async function startTrack(){
   if(!S.boxes.length||S.tracking)return;
@@ -2039,6 +2141,17 @@ function updTimeline(){
       div.style.left=((c.start/S.total)*100)+'%';
       div.style.width=(((c.end-c.start+1)/S.total)*100)+'%';
       div.title='Temporal clip '+c.start+'-'+c.end+' score='+c.score.toFixed(4);
+      lanesEl.appendChild(div);
+    });
+  }
+
+  /* Paint review marks — bright red vertical lines */
+  if(S.reviewMarks&&S.reviewMarks.size&&S.total>0){
+    S.reviewMarks.forEach(si=>{
+      var div=document.createElement('div');
+      div.className='tl-review';
+      div.style.left=((si/S.total)*100)+'%';
+      div.title='⚑ Review frame '+si;
       lanesEl.appendChild(div);
     });
   }
@@ -2446,6 +2559,7 @@ class Handler(BaseHTTPRequestHandler):
                 "current_frame": s.current_frame,
                 "objects": {str(k): v for k, v in s.objects.items()} if has_tracked else {},
                 "allowed_frames": self.allowed_frames,
+                "review_marks": sorted(self.tracker.state.review_marks),
             })
         elif p.startswith("/api/frame/"):
             d = self.video.frame_jpeg(int(p.split("/")[-1]))
@@ -2510,6 +2624,18 @@ class Handler(BaseHTTPRequestHandler):
             d = json.loads(body)
             self.tracker.state.current_frame = int(d.get("frame", 0))
             self._json({"ok": True})
+        elif p == "/api/toggle_review":
+            d = json.loads(body)
+            si = int(d["frame"])
+            s = self.tracker.state
+            if si in s.review_marks:
+                s.review_marks.discard(si)
+                marked = False
+            else:
+                s.review_marks.add(si)
+                marked = True
+            self.tracker._autosave_debounced()
+            self._json({"ok": True, "marked": marked, "review_marks": sorted(s.review_marks)})
         elif p == "/api/delete_object":
             d = json.loads(body)
             ok = self.tracker.delete_object(int(d["oid"]))
@@ -2579,6 +2705,7 @@ class Handler(BaseHTTPRequestHandler):
                             top_fraction=TEMPORAL_TOP_FRACTION,
                             max_frame=TEMPORAL_MAX_FRAME,
                             cache_dir=adir,
+                            allowed_frames=Handler.allowed_frames,
                         )
                 threading.Thread(target=_bg_setup, daemon=True).start()
                 self._json({"ok": True})
@@ -2690,6 +2817,7 @@ if __name__ == "__main__":
                     top_fraction=TEMPORAL_TOP_FRACTION,
                     max_frame=TEMPORAL_MAX_FRAME,
                     cache_dir=adir,
+                    allowed_frames=Handler.allowed_frames,
                 )
                 Handler.temporal_clips = clips
         threading.Thread(target=_bg_startup, daemon=True).start()

@@ -93,7 +93,7 @@ def find_similar_images(
             "closest_ref_idx": distances[idx].argmin(),
         })
 
-    results.sort(key=lambda x: x["min_distance"])
+    results.sort(key=lambda x: x["min_distance"], reverse=True)
 
     return results, min_distances
 
@@ -106,55 +106,103 @@ def display_similar_images(
         ref_features_root: Path,
         ref_images_root: Path,
         max_display: int = 10000,
+        port: int = 8766,
 ):
-    """Display images that are similar to reference set."""
+    """Display images to be filtered via a local web server with a/d keyboard navigation."""
+    import json as _json
+    import urllib.parse
+    from http.server import HTTPServer, BaseHTTPRequestHandler
+
     if not similar_results:
         print("No similar images found below threshold!")
         return
 
-    print(f"\nFound {len(similar_results)} images below threshold. Displaying up to {max_display}...")
-
     n_display = min(len(similar_results), max_display)
 
-    for i, result in enumerate(similar_results[:n_display]):
-        fig, axes = plt.subplots(1, 2, figsize=(12, 6))
-
-        target_img_path = feature_path_to_image_path(
-            result["feature_path"], features_root, images_root
+    pairs = []
+    for result in similar_results[:n_display]:
+        t = feature_path_to_image_path(result["feature_path"], features_root, images_root)
+        r = feature_path_to_image_path(
+            reference_feature_paths[result["closest_ref_idx"]], ref_features_root, ref_images_root
         )
+        pairs.append({"t": str(t), "r": str(r), "d": round(float(result["min_distance"]), 4)})
 
-        try:
-            target_img = Image.open(target_img_path)
-            axes[0].imshow(target_img)
-            axes[0].set_title(
-                f"Target (dist={result['min_distance']:.4f})\n{target_img_path.name}",
-                fontsize=10
-            )
-        except Exception as e:
-            axes[0].text(0.5, 0.5, f"Could not load:\n{target_img_path}\n{e}",
-                         ha='center', va='center', transform=axes[0].transAxes)
-            axes[0].set_title("Target (image not found)")
-        axes[0].axis("off")
+    pairs_json = _json.dumps(pairs)
 
-        ref_feature_path = reference_feature_paths[result["closest_ref_idx"]]
-        ref_img_path = feature_path_to_image_path(
-            ref_feature_path, ref_features_root, ref_images_root
-        )
+    html = f"""<!DOCTYPE html><html><head><meta charset="utf-8">
+<title>Filtered images</title>
+<style>
+  *{{box-sizing:border-box;margin:0;padding:0}}
+  body{{background:#111;color:#eee;font-family:sans-serif;height:100vh;display:flex;flex-direction:column}}
+  #bar{{padding:10px 16px;background:#1a1a1a;display:flex;align-items:center;gap:16px;flex-shrink:0}}
+  #counter{{font-weight:bold;font-size:1.1em}}
+  #dist{{color:#aaa;font-size:.95em}}
+  #name{{color:#666;font-size:.8em;margin-left:auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:50%}}
+  #hint{{font-size:.8em;color:#555}}
+  #imgs{{flex:1;display:flex;gap:8px;padding:8px;min-height:0}}
+  .slot{{flex:1;display:flex;flex-direction:column;min-height:0}}
+  .lbl{{font-size:.75em;color:#888;padding:2px 0 4px}}
+  .slot img{{flex:1;object-fit:contain;width:100%;min-height:0;border-radius:4px;background:#222}}
+</style></head><body>
+<div id="bar">
+  <span id="counter"></span>
+  <span id="dist"></span>
+  <span id="name"></span>
+  <span id="hint">a / ← &nbsp;&nbsp; d / →</span>
+</div>
+<div id="imgs">
+  <div class="slot"><div class="lbl">To be filtered</div><img id="imgT"></div>
+  <div class="slot"><div class="lbl">Closest reference</div><img id="imgR"></div>
+</div>
+<script>
+var pairs={pairs_json};
+var i=0;
+function show(){{
+  var p=pairs[i];
+  document.getElementById('counter').textContent=(i+1)+'/'+pairs.length;
+  document.getElementById('dist').textContent='dist='+p.d;
+  document.getElementById('name').textContent=p.t.split('/').slice(-2).join('/');
+  document.getElementById('imgT').src='/img?p='+encodeURIComponent(p.t)+'&i='+i;
+  document.getElementById('imgR').src='/img?p='+encodeURIComponent(p.r)+'&i='+i;
+}}
+document.addEventListener('keydown',function(e){{
+  if(e.key==='d'||e.key==='ArrowRight'){{if(i<pairs.length-1){{i++;show();}}}}
+  else if(e.key==='a'||e.key==='ArrowLeft'){{if(i>0){{i--;show();}}}}
+}});
+show();
+</script>
+</body></html>"""
 
-        try:
-            ref_img = Image.open(ref_img_path)
-            axes[1].imshow(ref_img)
-            axes[1].set_title(f"Closest Reference\n{ref_img_path.name}", fontsize=10)
-        except Exception as e:
-            axes[1].text(0.5, 0.5, f"Could not load:\n{ref_img_path}\n{e}",
-                         ha='center', va='center', transform=axes[1].transAxes)
-            axes[1].set_title("Reference (image not found)")
-        axes[1].axis("off")
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *a): pass
+        def do_GET(self):
+            if self.path == "/":
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(html.encode())
+            elif self.path.startswith("/img?p="):
+                p = Path(urllib.parse.unquote(self.path[7:].split("&")[0]))
+                if p.exists():
+                    self.send_response(200)
+                    self.send_header("Content-Type", "image/jpeg")
+                    self.end_headers()
+                    self.wfile.write(p.read_bytes())
+                else:
+                    self.send_error(404)
+            else:
+                self.send_error(404)
 
-        plt.suptitle(f"Image {i + 1}/{n_display} - Would be filtered out", fontsize=12)
-        plt.tight_layout()
-        plt.show()
-        plt.close(fig)
+    server = HTTPServer(("0.0.0.0", port), Handler)
+    print(f"\nViewer running at  http://localhost:{port}")
+    print(f"SSH tunnel:        ssh -L {port}:localhost:{port} user@host")
+    print("Press Ctrl+C to stop.\n")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
 
 
 def plot_distance_histogram(min_distances: np.ndarray, threshold: float):
