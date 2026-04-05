@@ -13,6 +13,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import multiprocessing as mp
 from pathlib import Path
 
 import torch
@@ -116,6 +117,49 @@ def _apply_overrides(cfg: Config, args) -> None:
         cfg.eval_frames_root = args.eval_frames_root
 
 
+def _run_one(cfg: Config) -> None:
+    """Run a single experiment in a subprocess."""
+    try:
+        run_experiment(cfg)
+    except Exception as e:
+        print(f"[FAILED] {cfg.EXPERIMENT_NAME} on {cfg.device}: {e}")
+
+
+def _run_parallel(configs: list[Config], gpus: list[int]) -> None:
+    """Distribute experiments round-robin across GPUs and run in parallel."""
+    # Assign devices round-robin
+    for i, cfg in enumerate(configs):
+        cfg.device = f"cuda:{gpus[i % len(gpus)]}"
+
+    print(f"Running {len(configs)} experiments across GPUs {gpus}")
+    for cfg in configs:
+        print(f"  {cfg.EXPERIMENT_NAME} → {cfg.device}")
+
+    # Group by GPU — run experiments on same GPU sequentially
+    from collections import defaultdict
+    gpu_groups: dict[str, list[Config]] = defaultdict(list)
+    for cfg in configs:
+        gpu_groups[cfg.device].append(cfg)
+
+    def _run_gpu_queue(cfgs: list[Config]):
+        for cfg in cfgs:
+            _run_one(cfg)
+
+    ctx = mp.get_context("spawn")
+    processes = []
+    for device, cfgs in gpu_groups.items():
+        p = ctx.Process(target=_run_gpu_queue, args=(cfgs,))
+        p.start()
+        processes.append((device, p))
+
+    for device, p in processes:
+        p.join()
+        if p.exitcode != 0:
+            print(f"[WARNING] Process for {device} exited with code {p.exitcode}")
+
+    print("All experiments finished.")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Foundation model pretraining")
     group = parser.add_mutually_exclusive_group()
@@ -138,6 +182,9 @@ def main():
                         help="Stop each epoch after this many steps (for testing)")
     parser.add_argument("--eval-frames-root", type=Path, default=None,
                         help="Validation frames directory for similarity eval")
+    parser.add_argument("--gpus", type=int, nargs="+", default=None,
+                        help="GPU ids to use. Multiple experiments run in parallel across GPUs "
+                             "(e.g. --gpus 0 1 assigns experiment 0→cuda:0, experiment 1→cuda:1)")
 
     args = parser.parse_args()
 
@@ -148,15 +195,25 @@ def main():
     elif args.experiment:
         cfg = EXPERIMENTS[args.experiment]()
         _apply_overrides(cfg, args)
+        if args.gpus and not args.device:
+            cfg.device = f"cuda:{args.gpus[0]}"
         run_experiment(cfg)
     else:
         # No arguments → run all experiments from get_experiment_configs()
         configs = get_experiment_configs()
-        print(f"Running {len(configs)} experiments")
-        for i, cfg in enumerate(configs, 1):
-            print(f"\n[{i}/{len(configs)}] {cfg.EXPERIMENT_NAME}")
+        for cfg in configs:
             _apply_overrides(cfg, args)
-            run_experiment(cfg)
+
+        if args.gpus and len(args.gpus) > 1 and not args.device:
+            _run_parallel(configs, args.gpus)
+        else:
+            if args.gpus and not args.device:
+                for cfg in configs:
+                    cfg.device = f"cuda:{args.gpus[0]}"
+            print(f"Running {len(configs)} experiments sequentially")
+            for i, cfg in enumerate(configs, 1):
+                print(f"\n[{i}/{len(configs)}] {cfg.EXPERIMENT_NAME}")
+                run_experiment(cfg)
 
 
 if __name__ == "__main__":
