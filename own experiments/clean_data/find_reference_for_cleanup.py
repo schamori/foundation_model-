@@ -18,6 +18,48 @@ from tqdm import tqdm
 from dataclasses import dataclass
 from collections import defaultdict
 import shutil
+import json as _json_mod
+
+
+# ── Anti-reference helpers ──────────────────────────────────────────
+
+def load_anti_references(anti_ref_file: Path) -> tuple[list[Path], np.ndarray | None]:
+    """Load anti-reference feature paths and their embeddings from disk."""
+    if not anti_ref_file or not anti_ref_file.exists():
+        return [], None
+    with open(anti_ref_file) as f:
+        data = _json_mod.load(f)
+    paths = [Path(p) for p in data.get("paths", [])]
+    embeddings = []
+    valid = []
+    for p in paths:
+        if p.exists():
+            try:
+                embeddings.append(np.load(p).astype(np.float32))
+                valid.append(p)
+            except Exception:
+                pass
+    if not embeddings:
+        return valid, None
+    return valid, np.vstack(embeddings)
+
+
+def save_anti_references(anti_ref_file: Path, paths: list[Path]):
+    """Save anti-reference feature paths to disk (deduplicates)."""
+    unique = list(dict.fromkeys(str(p) for p in paths))
+    anti_ref_file.parent.mkdir(parents=True, exist_ok=True)
+    with open(anti_ref_file, "w") as f:
+        _json_mod.dump({"paths": unique}, f)
+    print(f"[anti-ref] Saved {len(unique)} anti-reference paths to {anti_ref_file}")
+
+
+def _cosine_dist_to_anti_refs(embedding: np.ndarray, anti_ref_embeddings: np.ndarray) -> float:
+    """Return minimum cosine distance between embedding and any anti-reference."""
+    emb_norm = embedding / (np.linalg.norm(embedding) + 1e-8)
+    norms = np.linalg.norm(anti_ref_embeddings, axis=1, keepdims=True) + 1e-8
+    anti_norm = anti_ref_embeddings / norms
+    sims = anti_norm @ emb_norm
+    return float((1 - sims).min())
 
 
 @dataclass
@@ -120,32 +162,8 @@ def compute_temporal_changes(
     return np.array(change_scores)
 
 
-def find_all_temporal_changes(
-        features_root: Path,
-        window_size: int = 10,
-        min_gap: int = 20,
-        exclude_folders: list[str] | None = None,
-        folder_filter: str | None = None,
-        images_root: Path | None = None,
-) -> tuple[list[TemporalChange], np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Find ALL temporal discontinuities across all videos.
-
-    Args:
-        features_root: Root directory containing feature files
-        window_size: Number of frames before/after to compare
-        min_gap: Minimum gap between detected changes
-        exclude_folders: List of folder names to exclude
-        folder_filter: If provided, only process folders containing this string (case-insensitive)
-
-    Returns:
-        - List of TemporalChange objects (local maxima with min_gap)
-        - Array of ALL change scores for distribution plotting
-        - Global mean embedding (across all frames)
-        - Global std embedding (across all frames)
-    """
-    videos = get_feature_paths_by_video(features_root)
-
+def _filter_videos(videos: dict, features_root, exclude_folders, folder_filter, images_root):
+    """Apply exclusion and folder_filter to a videos dict. Returns filtered dict or None on error."""
     if images_root is not None:
         allowed = {d.name for d in images_root.rglob("*") if d.is_dir()}
         videos = {name: paths for name, paths in videos.items() if name in allowed}
@@ -157,86 +175,163 @@ def find_all_temporal_changes(
                 del videos[folder]
                 print(f"Excluded: {folder}")
 
-    # Filter by folder name if specified
     if folder_filter:
         folder_filter_lower = folder_filter.lower()
         filtered_videos = {
             name: paths for name, paths in videos.items()
             if folder_filter_lower in name.lower()
+            or any(folder_filter_lower in p.parent.parent.name.lower() for p in paths[:1])
         }
 
         if not filtered_videos:
-            print(f"\n❌ No folders found matching '{folder_filter}'")
+            print(f"\nNo folders found matching '{folder_filter}'")
             print("\nAvailable folders:")
             for name in sorted(videos.keys())[:20]:
                 print(f"    - '{name}'")
             if len(videos) > 20:
                 print(f"    ... and {len(videos) - 20} more")
-            return [], np.array([]), np.array([]), np.array([])
+            return None
 
-        print(f"\n🎯 Matched {len(filtered_videos)} folder(s) for '{folder_filter}':")
+        print(f"\nMatched {len(filtered_videos)} folder(s) for '{folder_filter}':")
         for name in sorted(filtered_videos.keys()):
             print(f"    - '{name}'")
         print()
 
         videos = filtered_videos
 
-    print(f"\nProcessing {len(videos)} videos with window_size={window_size}")
+    return videos
 
+
+def _analyze_video(video_name, feature_paths, window_size, min_gap):
+    """Analyze a single video. Returns (changes, scores, features) or None."""
+    if len(feature_paths) < 2 * window_size:
+        return None
+
+    features = load_video_features(feature_paths)
+    if features is None:
+        return None
+
+    change_scores = compute_temporal_changes(features, window_size)
+    if len(change_scores) == 0:
+        return [], change_scores.tolist(), features
+
+    positions = np.argsort(change_scores)[::-1]
+    selected = []
+    changes = []
+    for pos in positions:
+        actual_pos = pos + window_size
+        too_close = any(abs(actual_pos - s) < min_gap for s in selected)
+        if not too_close:
+            selected.append(actual_pos)
+            changes.append(TemporalChange(
+                position=actual_pos,
+                change_score=change_scores[pos],
+                video_name=video_name,
+                frame_paths=feature_paths,
+                window_size=window_size,
+            ))
+
+    return changes, change_scores.tolist(), features
+
+
+def find_all_temporal_changes(
+        features_root: Path,
+        window_size: int = 10,
+        min_gap: int = 20,
+        exclude_folders: list[str] | None = None,
+        folder_filter: str | None = None,
+        images_root: Path | None = None,
+        _cache: dict | None = None,
+        dirty_videos: set[str] | None = None,
+) -> tuple[list[TemporalChange], np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Find ALL temporal discontinuities across all videos.
+
+    Incremental mode: if _cache and dirty_videos are provided, only reprocess
+    the dirty videos and reuse cached results for the rest.
+
+    Args:
+        features_root: Root directory containing feature files
+        window_size: Number of frames before/after to compare
+        min_gap: Minimum gap between detected changes
+        exclude_folders: List of folder names to exclude
+        folder_filter: If provided, only process folders containing this string (case-insensitive)
+        images_root: If provided, only process videos with matching image dirs
+        _cache: Dict of per-video cached results {video_name: (changes, scores, embeddings)}
+                Pass the same dict across calls to enable incremental mode.
+        dirty_videos: Set of video names that need reprocessing. If None, process all.
+
+    Returns:
+        - List of TemporalChange objects (local maxima with min_gap)
+        - Array of ALL change scores for distribution plotting
+        - Global mean embedding (across all frames)
+        - Global std embedding (across all frames)
+    """
+    incremental = _cache is not None and dirty_videos is not None
+
+    videos = get_feature_paths_by_video(features_root)
+    videos = _filter_videos(videos, features_root, exclude_folders, folder_filter, images_root)
+    if videos is None:
+        return [], np.array([]), np.array([]), np.array([])
+
+    if incremental:
+        to_process = {n: p for n, p in videos.items() if n in dirty_videos}
+        cached_count = len(videos) - len(to_process)
+        # Remove stale cache entries for videos no longer in the set
+        for k in list(_cache.keys()):
+            if k not in videos:
+                del _cache[k]
+        print(f"\n[incremental] Reprocessing {len(to_process)} dirty videos, reusing {cached_count} cached")
+    else:
+        to_process = videos
+        if _cache is not None:
+            _cache.clear()
+        print(f"\nProcessing {len(videos)} videos with window_size={window_size}")
+
+    for video_name, feature_paths in tqdm(to_process.items(), desc="Analyzing videos"):
+        result = _analyze_video(video_name, feature_paths, window_size, min_gap)
+        if result is None:
+            if _cache is not None and video_name in _cache:
+                del _cache[video_name]
+            continue
+        if _cache is not None:
+            _cache[video_name] = result
+
+    # Assemble results from cache (or from freshly computed data)
     all_changes = []
-    all_scores = []  # Store ALL scores for distribution
-    all_embeddings = []  # Store ALL embeddings for global stats
+    all_scores = []
+    all_embeddings = []
 
-    for video_name, feature_paths in tqdm(videos.items(), desc="Analyzing videos"):
-        if len(feature_paths) < 2 * window_size:
-            print(f"  Skipping {video_name}: only {len(feature_paths)} frames (need {2 * window_size})")
-            continue
+    source = _cache if _cache is not None else {}
+    # If no cache, we need to process everything inline (shouldn't happen in normal flow)
+    if not _cache:
+        for video_name, feature_paths in videos.items():
+            result = _analyze_video(video_name, feature_paths, window_size, min_gap)
+            if result is None:
+                continue
+            changes, scores, features = result
+            all_changes.extend(changes)
+            all_scores.extend(scores)
+            all_embeddings.append(features)
+    else:
+        for video_name in videos:
+            if video_name not in _cache:
+                continue
+            changes, scores, features = _cache[video_name]
+            all_changes.extend(changes)
+            all_scores.extend(scores)
+            all_embeddings.append(features)
 
-        # Load features
-        features = load_video_features(feature_paths)
-        if features is None:
-            continue
-
-        # Store all embeddings for global stats
-        all_embeddings.append(features)
-
-        # Compute change scores
-        change_scores = compute_temporal_changes(features, window_size)
-
-        if len(change_scores) == 0:
-            continue
-
-        # Store all scores for distribution
-        all_scores.extend(change_scores.tolist())
-
-        # Find local maxima with minimum gap
-        positions = np.argsort(change_scores)[::-1]  # Descending
-
-        selected = []
-        for pos in positions:
-            actual_pos = pos + window_size
-
-            too_close = any(abs(actual_pos - s) < min_gap for s in selected)
-            if not too_close:
-                selected.append(actual_pos)
-
-                all_changes.append(TemporalChange(
-                    position=actual_pos,
-                    change_score=change_scores[pos],
-                    video_name=video_name,
-                    frame_paths=feature_paths,
-                    window_size=window_size,
-                ))
-
-    # Sort all changes by score
     all_changes.sort(key=lambda x: x.change_score, reverse=True)
 
-    # Compute global embedding stats
-    all_embeddings_stacked = np.vstack(all_embeddings)
-    global_mean = np.mean(all_embeddings_stacked, axis=0)
-    global_std = np.std(all_embeddings_stacked, axis=0)
-
-    print(f"Computed global stats from {len(all_embeddings_stacked):,} embeddings")
+    if all_embeddings:
+        all_embeddings_stacked = np.vstack(all_embeddings)
+        global_mean = np.mean(all_embeddings_stacked, axis=0)
+        global_std = np.std(all_embeddings_stacked, axis=0)
+        print(f"Computed global stats from {len(all_embeddings_stacked):,} embeddings")
+    else:
+        global_mean = np.array([])
+        global_std = np.array([])
 
     return all_changes, np.array(all_scores), global_mean, global_std
 
@@ -358,11 +453,13 @@ def display_temporal_changes(
         save_reference_images: bool = False,
         reference_images_dir: Path | None = None,
         n_context: int = 1,  # Ignored now, always shows 2 frames
+        anti_ref_embeddings: np.ndarray | None = None,
+        anti_ref_threshold: float = 0.3,
 ):
     """Display the detected temporal changes - shows current and next frame, picks higher deviation from global mean as reference."""
     if not changes:
         print("No changes to display!")
-        return
+        return [], []
 
     # Create reference images directory if saving
     if save_reference_images and reference_images_dir:
@@ -379,6 +476,7 @@ def display_temporal_changes(
     print(f"\nBuilding viewer for {len(changes)} temporal changes...")
 
     saved_count = 0
+    auto_skipped = 0
     ref_feature_paths = []
     pairs = []
 
@@ -405,8 +503,17 @@ def display_temporal_changes(
 
         if dev_before > dev_after:
             chosen_idx, chosen_label, chosen_path = frame_before_idx, "BEFORE", paths[frame_before_idx]
+            chosen_emb = emb_before
         else:
             chosen_idx, chosen_label, chosen_path = frame_after_idx, "AFTER", paths[frame_after_idx]
+            chosen_emb = emb_after
+
+        # Auto-skip if too similar to an anti-reference
+        if anti_ref_embeddings is not None and len(anti_ref_embeddings) > 0:
+            dist = _cosine_dist_to_anti_refs(chosen_emb, anti_ref_embeddings)
+            if dist < anti_ref_threshold:
+                auto_skipped += 1
+                continue
 
         img_before = feature_path_to_image_path(paths[frame_before_idx], features_root, images_root)
         img_after  = feature_path_to_image_path(paths[frame_after_idx],  features_root, images_root)
@@ -432,6 +539,10 @@ def display_temporal_changes(
     if save_reference_images:
         print(f"Saved {saved_count} reference images to: {reference_images_dir}")
 
+    if auto_skipped:
+        print(f"[anti-ref] Auto-skipped {auto_skipped} changes (similar to anti-references, threshold={anti_ref_threshold})")
+    print(f"{len(pairs)} reference candidates remaining")
+
     pairs_json = _json.dumps(pairs)
     html = f"""<!DOCTYPE html><html><head><meta charset="utf-8">
 <title>Temporal changes</title>
@@ -442,6 +553,7 @@ def display_temporal_changes(
   #counter{{font-weight:bold;font-size:1.1em}}
   #score{{color:#f90;font-size:.95em}}
   #video{{color:#666;font-size:.8em;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:40%}}
+  #exinfo{{color:#f44;font-size:.85em;font-weight:bold}}
   #hint{{font-size:.8em;color:#555;margin-left:auto}}
   #imgs{{flex:1;display:flex;gap:8px;padding:8px;min-height:0}}
   .slot{{flex:1;display:flex;flex-direction:column;min-height:0}}
@@ -449,13 +561,16 @@ def display_temporal_changes(
   .lbl span{{color:#4f4;font-weight:bold}}
   .slot img{{flex:1;object-fit:contain;width:100%;min-height:0;border-radius:4px;background:#222}}
   .chosen img{{outline:3px solid #4f4;border-radius:4px}}
+  .excluded img{{outline:3px solid #f44!important;opacity:.4}}
+  .excluded .lbl{{color:#f44}}
   .missing{{flex:1;display:flex;align-items:center;justify-content:center;color:#555;font-size:.9em;background:#1a1a1a;border-radius:4px}}
 </style></head><body>
 <div id="bar">
   <span id="counter"></span>
   <span id="score"></span>
+  <span id="exinfo"></span>
   <span id="video"></span>
-  <span id="hint">a / ← &nbsp;&nbsp; d / →</span>
+  <span id="hint">a/d navigate &nbsp; x = exclude &nbsp; Ctrl+C done</span>
 </div>
 <div id="imgs">
   <div class="slot" id="slotB"><div class="lbl" id="lblB">BEFORE</div><img id="imgB"></div>
@@ -464,10 +579,14 @@ def display_temporal_changes(
 <script>
 var pairs={pairs_json};
 var i=0;
+var excluded=new Set();
 function show(){{
   var p=pairs[i];
-  document.getElementById('counter').textContent=(i+1)+'/'+pairs.length;
+  var isEx=excluded.has(i);
+  var exCount=excluded.size;
+  document.getElementById('counter').textContent=(i+1)+'/'+pairs.length+(isEx?' [EXCLUDED]':'');
   document.getElementById('score').textContent='score='+p.score;
+  document.getElementById('exinfo').textContent=exCount?exCount+' excluded':'';
   document.getElementById('video').textContent=p.video;
   function setSlotImg(imgId, path, idx, suffix){{
     var el=document.getElementById(imgId);
@@ -479,18 +598,25 @@ function show(){{
   setSlotImg('imgB',p.before,i,'b');
   setSlotImg('imgA',p.after,i,'a');
   var chB=p.chosen==='BEFORE';
-  document.getElementById('slotB').className='slot'+(chB?' chosen':'');
-  document.getElementById('slotA').className='slot'+(!chB?' chosen':'');
-  document.getElementById('lblB').innerHTML='BEFORE &mdash; dev='+p.dev_before+(chB?' <span>✓ reference</span>':'');
-  document.getElementById('lblA').innerHTML='AFTER &mdash; dev='+p.dev_after+(!chB?' <span>✓ reference</span>':'');
+  document.getElementById('slotB').className='slot'+(chB?' chosen':'')+(isEx?' excluded':'');
+  document.getElementById('slotA').className='slot'+(!chB?' chosen':'')+(isEx?' excluded':'');
+  document.getElementById('lblB').innerHTML='BEFORE &mdash; dev='+p.dev_before+(chB?' <span>\\u2713 reference</span>':'');
+  document.getElementById('lblA').innerHTML='AFTER &mdash; dev='+p.dev_after+(!chB?' <span>\\u2713 reference</span>':'');
 }}
 document.addEventListener('keydown',function(e){{
   if(e.key==='d'||e.key==='ArrowRight'){{if(i<pairs.length-1){{i++;show();}}}}
   else if(e.key==='a'||e.key==='ArrowLeft'){{if(i>0){{i--;show();}}}}
+  else if(e.key==='x'){{
+    if(excluded.has(i))excluded.delete(i);else excluded.add(i);
+    fetch('/exclude',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{index:i,exclude:excluded.has(i)}})}});
+    show();
+  }}
 }});
 show();
 </script>
 </body></html>"""
+
+    excluded_set = set()
 
     if show_viewer:
         class Handler(BaseHTTPRequestHandler):
@@ -512,11 +638,27 @@ show();
                         self.send_error(404)
                 else:
                     self.send_error(404)
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", 0))
+                body = self.rfile.read(length)
+                if self.path == "/exclude":
+                    data = _json.loads(body)
+                    idx = int(data["index"])
+                    if data["exclude"]:
+                        excluded_set.add(idx)
+                    else:
+                        excluded_set.discard(idx)
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(b'{"ok":true}')
+                else:
+                    self.send_error(404)
 
         server = HTTPServer(("0.0.0.0", 8767), Handler)
         print(f"\nViewer running at  http://localhost:8767")
         print(f"SSH tunnel:        ssh -L 8767:localhost:8767 user@host")
-        print("Press Ctrl+C to continue.\n")
+        print("Press x to mark/unmark as anti-reference, Ctrl+C when done.\n")
         try:
             server.serve_forever()
         except KeyboardInterrupt:
@@ -524,7 +666,14 @@ show();
         finally:
             server.server_close()
 
-    return ref_feature_paths
+    # Split into kept references and newly excluded anti-references
+    excluded_paths = [ref_feature_paths[i] for i in sorted(excluded_set) if i < len(ref_feature_paths)]
+    kept_paths = [p for i, p in enumerate(ref_feature_paths) if i not in excluded_set]
+
+    if excluded_paths:
+        print(f"[anti-ref] User excluded {len(excluded_paths)} references")
+
+    return kept_paths, excluded_paths
 
 
 def main():
@@ -599,7 +748,7 @@ def main():
             # Ask to visualize
             viz = input(f"\nVisualize {min(max_display, len(filtered_changes))} changes? (y/n): ").strip().lower()
             if viz == 'y':
-                display_temporal_changes(
+                _kept, _excl = display_temporal_changes(
                     filtered_changes[:max_display],  # Only show max_display
                     features_root,
                     images_root,

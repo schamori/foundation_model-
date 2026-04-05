@@ -107,15 +107,19 @@ def display_similar_images(
         ref_images_root: Path,
         max_display: int = 10000,
         port: int = 8766,
-):
-    """Display images to be filtered via a local web server with a/d keyboard navigation."""
+) -> set[int]:
+    """Display images to be filtered via a local web server with a/d keyboard navigation.
+
+    Press x to exclude the reference shown for the current pair.
+    Returns set of excluded reference indices (closest_ref_idx values).
+    """
     import json as _json
     import urllib.parse
     from http.server import HTTPServer, BaseHTTPRequestHandler
 
     if not similar_results:
         print("No similar images found below threshold!")
-        return
+        return set()
 
     n_display = min(len(similar_results), max_display)
 
@@ -125,7 +129,10 @@ def display_similar_images(
         r = feature_path_to_image_path(
             reference_feature_paths[result["closest_ref_idx"]], ref_features_root, ref_images_root
         )
-        pairs.append({"t": str(t), "r": str(r), "d": round(float(result["min_distance"]), 4)})
+        pairs.append({
+            "t": str(t), "r": str(r), "d": round(float(result["min_distance"]), 4),
+            "ri": int(result["closest_ref_idx"]),
+        })
 
     pairs_json = _json.dumps(pairs)
 
@@ -134,44 +141,61 @@ def display_similar_images(
 <style>
   *{{box-sizing:border-box;margin:0;padding:0}}
   body{{background:#111;color:#eee;font-family:sans-serif;height:100vh;display:flex;flex-direction:column}}
-  #bar{{padding:10px 16px;background:#1a1a1a;display:flex;align-items:center;gap:16px;flex-shrink:0}}
+  #bar{{padding:10px 16px;background:#1a1a1a;display:flex;align-items:center;gap:16px;flex-shrink:0;flex-wrap:wrap}}
   #counter{{font-weight:bold;font-size:1.1em}}
   #dist{{color:#aaa;font-size:.95em}}
-  #name{{color:#666;font-size:.8em;margin-left:auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:50%}}
-  #hint{{font-size:.8em;color:#555}}
+  #exinfo{{color:#f44;font-size:.85em;font-weight:bold}}
+  #name{{color:#666;font-size:.8em;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:40%}}
+  #hint{{font-size:.8em;color:#555;margin-left:auto}}
   #imgs{{flex:1;display:flex;gap:8px;padding:8px;min-height:0}}
   .slot{{flex:1;display:flex;flex-direction:column;min-height:0}}
   .lbl{{font-size:.75em;color:#888;padding:2px 0 4px}}
   .slot img{{flex:1;object-fit:contain;width:100%;min-height:0;border-radius:4px;background:#222}}
+  .ref-excluded img{{outline:3px solid #f44;opacity:.4}}
+  .ref-excluded .lbl{{color:#f44}}
 </style></head><body>
 <div id="bar">
   <span id="counter"></span>
   <span id="dist"></span>
+  <span id="exinfo"></span>
   <span id="name"></span>
-  <span id="hint">a / ← &nbsp;&nbsp; d / →</span>
+  <span id="hint">a/d navigate &nbsp; x = exclude reference &nbsp; Ctrl+C done</span>
 </div>
 <div id="imgs">
   <div class="slot"><div class="lbl">To be filtered</div><img id="imgT"></div>
-  <div class="slot"><div class="lbl">Closest reference</div><img id="imgR"></div>
+  <div class="slot" id="slotR"><div class="lbl" id="lblR">Closest reference</div><img id="imgR"></div>
 </div>
 <script>
 var pairs={pairs_json};
 var i=0;
+var excludedRefs=new Set();
 function show(){{
   var p=pairs[i];
+  var isEx=excludedRefs.has(p.ri);
   document.getElementById('counter').textContent=(i+1)+'/'+pairs.length;
   document.getElementById('dist').textContent='dist='+p.d;
+  document.getElementById('exinfo').textContent=excludedRefs.size?excludedRefs.size+' refs excluded':'';
   document.getElementById('name').textContent=p.t.split('/').slice(-2).join('/');
   document.getElementById('imgT').src='/img?p='+encodeURIComponent(p.t)+'&i='+i;
   document.getElementById('imgR').src='/img?p='+encodeURIComponent(p.r)+'&i='+i;
+  document.getElementById('slotR').className='slot'+(isEx?' ref-excluded':'');
+  document.getElementById('lblR').textContent='Closest reference'+(isEx?' [EXCLUDED]':'');
 }}
 document.addEventListener('keydown',function(e){{
   if(e.key==='d'||e.key==='ArrowRight'){{if(i<pairs.length-1){{i++;show();}}}}
   else if(e.key==='a'||e.key==='ArrowLeft'){{if(i>0){{i--;show();}}}}
+  else if(e.key==='x'){{
+    var ri=pairs[i].ri;
+    if(excludedRefs.has(ri))excludedRefs.delete(ri);else excludedRefs.add(ri);
+    fetch('/exclude_ref',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{ref_idx:ri,exclude:excludedRefs.has(ri)}})}});
+    show();
+  }}
 }});
 show();
 </script>
 </body></html>"""
+
+    excluded_refs = set()
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *a): pass
@@ -192,17 +216,38 @@ show();
                     self.send_error(404)
             else:
                 self.send_error(404)
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(length)
+            if self.path == "/exclude_ref":
+                data = _json.loads(body)
+                ri = int(data["ref_idx"])
+                if data["exclude"]:
+                    excluded_refs.add(ri)
+                else:
+                    excluded_refs.discard(ri)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"ok":true}')
+            else:
+                self.send_error(404)
 
     server = HTTPServer(("0.0.0.0", port), Handler)
     print(f"\nViewer running at  http://localhost:{port}")
     print(f"SSH tunnel:        ssh -L {port}:localhost:{port} user@host")
-    print("Press Ctrl+C to stop.\n")
+    print("Press x to exclude a reference, Ctrl+C when done.\n")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
         server.server_close()
+
+    if excluded_refs:
+        print(f"[viewer] Excluded {len(excluded_refs)} references")
+
+    return excluded_refs
 
 
 def plot_distance_histogram(min_distances: np.ndarray, threshold: float):
@@ -269,27 +314,34 @@ def delete_filtered_images(
         similar_results: list,
         features_root: Path,
         images_root: Path,
-):
-    """Delete filtered images and their corresponding feature files."""
+) -> set[str]:
+    """Delete filtered images and their corresponding feature files.
+
+    Returns set of affected video folder names (for incremental reprocessing).
+    """
     print(f"\nDeleting {len(similar_results)} images...")
 
     deleted_images = 0
     deleted_features = 0
+    affected_videos = set()
 
     for result in tqdm(similar_results, desc="Deleting"):
+        feature_path = result["feature_path"]
+        affected_videos.add(feature_path.parent.name)
+
         # Delete image
-        img_path = feature_path_to_image_path(result["feature_path"], features_root, images_root)
+        img_path = feature_path_to_image_path(feature_path, features_root, images_root)
         if img_path and img_path.exists():
             os.remove(img_path)
             deleted_images += 1
 
         # Delete feature file
-        feature_path = result["feature_path"]
         if feature_path.exists():
             os.remove(feature_path)
             deleted_features += 1
 
-    print(f"Deleted {deleted_images} images and {deleted_features} feature files")
+    print(f"Deleted {deleted_images} images and {deleted_features} feature files ({len(affected_videos)} videos affected)")
+    return affected_videos
 
 
 def main():

@@ -152,9 +152,8 @@ def extract_and_save_features(
 
 def main():
     # ===== CONFIGURATION =====
-    input_dir = Path(r"/media/HDD1/moritz/foundential/Extracted Frames/reference images")
-    output_dir = Path(r"/media/HDD1/moritz/foundential/Extracted Frames Features/reference images")
-
+    input_dir = Path(r"/media/HDD1/moritz/foundential/Extracted Frames")
+    output_dir = Path(r"/media/HDD1/moritz/foundential/Extracted Frames Features")
     batch_size = 512
     skip_existing = True
     # =========================

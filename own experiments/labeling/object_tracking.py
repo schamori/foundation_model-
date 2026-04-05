@@ -36,7 +36,7 @@ import torch
 #  CONFIG
 # ═══════════════════════════════════════════════════════════════
 VIDEO_PATH    = None   # set automatically from last-used video; use the picker to select
-PORT          = 8765
+PORT          = 8766
 SAMPLE_FPS    = 1
 TRACK_SECONDS = 50
 SAM2_HF_ID   = "facebook/sam2-hiera-large"
