@@ -1,0 +1,142 @@
+{
+  "method": "faiss_gpu_kmeans_monte_carlo",
+  "cluster_source": "frame_embedding_kmeans",
+  "rank": 14,
+  "mc_score": 0.048552161840539454,
+  "n_videos": 80,
+  "k_clusters": 20,
+  "train_video_count": 64,
+  "test_video_count": 16,
+  "test_video_ratio": 0.2,
+  "test_frame_ratio": 0.19981788420470684,
+  "target_test_video_ratio": 0.2,
+  "target_test_frame_ratio": 0.2,
+  "similarity_score": 14.890008839126569,
+  "similarity_score_lw0": 15.945452580000563,
+  "cluster_frame_counts": [
+    {
+      "cluster": 0,
+      "train_frames": 8840,
+      "test_frames": 2215,
+      "total_frames": 11055
+    },
+    {
+      "cluster": 1,
+      "train_frames": 8810,
+      "test_frames": 2247,
+      "total_frames": 11057
+    },
+    {
+      "cluster": 2,
+      "train_frames": 1509,
+      "test_frames": 287,
+      "total_frames": 1796
+    },
+    {
+      "cluster": 3,
+      "train_frames": 10448,
+      "test_frames": 3053,
+      "total_frames": 13501
+    },
+    {
+      "cluster": 4,
+      "train_frames": 3906,
+      "test_frames": 753,
+      "total_frames": 4659
+    },
+    {
+      "cluster": 5,
+      "train_frames": 7263,
+      "test_frames": 1838,
+      "total_frames": 9101
+    },
+    {
+      "cluster": 6,
+      "train_frames": 9569,
+      "test_frames": 3151,
+      "total_frames": 12720
+    },
+    {
+      "cluster": 7,
+      "train_frames": 8323,
+      "test_frames": 2032,
+      "total_frames": 10355
+    },
+    {
+      "cluster": 8,
+      "train_frames": 4323,
+      "test_frames": 801,
+      "total_frames": 5124
+    },
+    {
+      "cluster": 9,
+      "train_frames": 6103,
+      "test_frames": 1339,
+      "total_frames": 7442
+    },
+    {
+      "cluster": 10,
+      "train_frames": 6258,
+      "test_frames": 1305,
+      "total_frames": 7563
+    },
+    {
+      "cluster": 11,
+      "train_frames": 8660,
+      "test_frames": 2092,
+      "total_frames": 10752
+    },
+    {
+      "cluster": 12,
+      "train_frames": 11286,
+      "test_frames": 2784,
+      "total_frames": 14070
+    },
+    {
+      "cluster": 13,
+      "train_frames": 4301,
+      "test_frames": 878,
+      "total_frames": 5179
+    },
+    {
+      "cluster": 14,
+      "train_frames": 8090,
+      "test_frames": 2017,
+      "total_frames": 10107
+    },
+    {
+      "cluster": 15,
+      "train_frames": 8438,
+      "test_frames": 1883,
+      "total_frames": 10321
+    },
+    {
+      "cluster": 16,
+      "train_frames": 6497,
+      "test_frames": 1235,
+      "total_frames": 7732
+    },
+    {
+      "cluster": 17,
+      "train_frames": 7297,
+      "test_frames": 1760,
+      "total_frames": 9057
+    },
+    {
+      "cluster": 18,
+      "train_frames": 8239,
+      "test_frames": 2063,
+      "total_frames": 10302
+    },
+    {
+      "cluster": 19,
+      "train_frames": 9472,
+      "test_frames": 3133,
+      "total_frames": 12605
+    }
+  ],
+  "markov_label_meta": null,
+  "labels_csv_path": null,
+  "seed": 2488935,
+  "gpu_id": 0
+}

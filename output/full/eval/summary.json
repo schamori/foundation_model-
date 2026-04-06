@@ -1,0 +1,122 @@
+[
+  {
+    "epoch": 1,
+    "metrics": {
+      "similarity": {
+        "error": "cannot import name 'load_backbone_from_checkpoint' from 'src.model.dino' (/home/moritz/Foundential Model/src/model/dino.py)"
+      },
+      "cross_video_retrieval": {
+        "epoch": 1,
+        "status": "skeleton",
+        "note": "Add phase labels to enable precision@K evaluation"
+      },
+      "knn": {
+        "skipped": "knn_labels_root not set or not found"
+      }
+    }
+  },
+  {
+    "epoch": 2,
+    "metrics": {
+      "similarity": {
+        "error": "cannot import name 'load_backbone_from_checkpoint' from 'src.model.dino' (/home/moritz/Foundential Model/src/model/dino.py)"
+      },
+      "cross_video_retrieval": {
+        "epoch": 2,
+        "status": "skeleton",
+        "note": "Add phase labels to enable precision@K evaluation"
+      },
+      "knn": {
+        "skipped": "knn_labels_root not set or not found"
+      }
+    }
+  },
+  {
+    "epoch": 1,
+    "metrics": {
+      "similarity": {
+        "error": "no sample images found"
+      },
+      "cross_video_retrieval": {
+        "epoch": 1,
+        "status": "skeleton",
+        "note": "Add phase labels to enable precision@K evaluation"
+      },
+      "knn": {
+        "skipped": "knn_labels_root not set or not found"
+      }
+    }
+  },
+  {
+    "epoch": 1,
+    "metrics": {
+      "similarity": {
+        "error": "'str' object has no attribute 'is_dir'"
+      },
+      "cross_video_retrieval": {
+        "epoch": 1,
+        "status": "skeleton",
+        "note": "Add phase labels to enable precision@K evaluation"
+      },
+      "knn": {
+        "skipped": "knn_labels_root not set or not found"
+      }
+    }
+  },
+  {
+    "epoch": 1,
+    "metrics": {
+      "similarity": {
+        "epoch": 1,
+        "train_sws": 0.4060405337869408,
+        "train_augmentation_stability": {
+          "hflip": 0.44115095173931335,
+          "color_jitter": 0.9645685058534146,
+          "blur": 0.9887719333767891
+        },
+        "val_sws": 0.4042775311064232,
+        "val_augmentation_stability": {
+          "hflip": 0.451415735926741,
+          "color_jitter": 0.9623826906085015,
+          "blur": 0.985986483991146
+        }
+      },
+      "cross_video_retrieval": {
+        "epoch": 1,
+        "status": "skeleton",
+        "note": "Add phase labels to enable precision@K evaluation"
+      },
+      "knn": {
+        "skipped": "knn_labels_root not set or not found"
+      }
+    }
+  },
+  {
+    "epoch": 2,
+    "metrics": {
+      "similarity": {
+        "epoch": 2,
+        "train_sws": 0.48184195137435704,
+        "train_augmentation_stability": {
+          "hflip": 0.5866254023339134,
+          "color_jitter": 0.9897670847773551,
+          "blur": 0.9987153396010399
+        },
+        "val_sws": 0.4895290977168852,
+        "val_augmentation_stability": {
+          "hflip": 0.6006841383147985,
+          "color_jitter": 0.9912467339634895,
+          "blur": 0.9988389272093773
+        }
+      },
+      "cross_video_retrieval": {
+        "epoch": 2,
+        "status": "skeleton",
+        "note": "Add phase labels to enable precision@K evaluation"
+      },
+      "knn": {
+        "skipped": "knn_labels_root not set or not found"
+      }
+    }
+  }
+]

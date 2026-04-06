@@ -1,0 +1,8 @@
+{
+  "timestamp": "20260317_183858",
+  "temporal_threshold": 0.6,
+  "filter_threshold": 0.1,
+  "folder_filter": null,
+  "n_references": 27,
+  "n_deleted": 110
+}

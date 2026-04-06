@@ -1,0 +1,8 @@
+{
+  "timestamp": "20260311_172159",
+  "temporal_threshold": 0.6818,
+  "filter_threshold": 0.36,
+  "folder_filter": "ATLR",
+  "n_references": 1,
+  "n_deleted": 1
+}

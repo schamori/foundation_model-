@@ -1,0 +1,29 @@
+{
+  "epoch": 1,
+  "checkpoint": "/home/moritz/Foundential Model/output/full/checkpoints/dino_epoch1.pt",
+  "metrics": {
+    "similarity": {
+      "epoch": 1,
+      "train_sws": 0.4060405337869408,
+      "train_augmentation_stability": {
+        "hflip": 0.44115095173931335,
+        "color_jitter": 0.9645685058534146,
+        "blur": 0.9887719333767891
+      },
+      "val_sws": 0.4042775311064232,
+      "val_augmentation_stability": {
+        "hflip": 0.451415735926741,
+        "color_jitter": 0.9623826906085015,
+        "blur": 0.985986483991146
+      }
+    },
+    "cross_video_retrieval": {
+      "epoch": 1,
+      "status": "skeleton",
+      "note": "Add phase labels to enable precision@K evaluation"
+    },
+    "knn": {
+      "skipped": "knn_labels_root not set or not found"
+    }
+  }
+}

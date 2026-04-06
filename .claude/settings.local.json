@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python:*)",
+      "Bash(python3:*)",
+      "Bash(nvidia-smi --query-gpu=index,name,memory.used,memory.total --format=csv,noheader)",
+      "Bash(xargs -I{} python3 -c \" import json, sys f = sys.argv[1] d = json.load\\(open\\(f\\)\\) clips = d.get\\(''clips'', []\\) print\\(f''{f}:''\\) print\\(f'' clip_length={d.get\\(\"\"clip_length\"\"\\)}, top_fraction={d.get\\(\"\"top_fraction\"\"\\)}''\\) print\\(f'' {len\\(clips\\)} clips: {clips[:3]}''\\) \" {})",
+      "Bash(grep -l \"_cap_duration_to_clip\\\\|_prefix_key\\\\|_trailing_digits\" \"/home/moritz/Foundential Model/own experiments/labeling/\"*)",
+      "Bash(mkdir -p \"/media/HDD1/moritz/foundential/Extracted Frames/test/anti_references\")",
+      "Bash(mv \"/media/HDD1/moritz/foundential/Extracted Frames/test/anti_references.json\" \"/media/HDD1/moritz/foundential/Extracted Frames/test/anti_references/Tumour_Resections.json\")",
+      "Read(//media/HDD1/moritz/**)"
+    ]
+  }
+}

@@ -1,0 +1,33 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//home/moritz/Foundential\\\\ Model/LEMON/**)",
+      "Read(//home/moritz/Foundential\\\\ Model/SurgeNet/**)",
+      "Read(//home/moritz/Foundential\\\\ Model/LEMON/lemonfm/**)",
+      "Read(//home/moritz/**)",
+      "Bash(wc -l \"/home/moritz/Foundential Model\"/LEMON/lemonfm/*.py \"/home/moritz/Foundential Model\"/LEMON/src/*.py)",
+      "Bash(wc -l LEMON/lemonfm/*.py LEMON/src/*.py)",
+      "WebFetch(domain:github.com)",
+      "WebSearch",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:api.github.com)",
+      "Bash(curl -s \"https://api.github.com/repos/rlpddejong/SurgeNetDINO/contents/load_models.py\")",
+      "Bash(find '/home/moritz/Foundential Model/output/' -name *.pt -o -name *.pth)",
+      "Bash(gh repo:*)",
+      "Bash(python -c \":*)",
+      "Bash(bc)",
+      "Bash(xargs grep:*)",
+      "Bash(grep -E \"\\\\.py$|^d\")",
+      "Bash(grep -r class.*Dataset src/)",
+      "Bash(grep -r \"def train\\\\|Trainer\\\\|frames_root\" '/home/moritz/Foundential Model/src' --include=*.py)",
+      "Bash(grep -r \"V-JEPA\\\\|V_JEPA\\\\|vjepa\\\\|VideoJEPA\" . --include=*.py)",
+      "Bash(grep -r \"FrameReader\\\\|VideoReader\" '/home/moritz/Foundential Model/src' --include=*.py)",
+      "Bash(find '/home/moritz/Foundential Model' -name README* -o -name demo* -o -name example*)",
+      "Bash(find \"/home/moritz/Foundential Model/src\" -type f -name \"*.py\" -exec wc -l {} +)",
+      "Bash(python3 -c \":*)"
+    ],
+    "additionalDirectories": [
+      "/home/moritz/Foundential Model/src/datasplitting"
+    ]
+  }
+}
