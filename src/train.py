@@ -115,6 +115,8 @@ def _apply_overrides(cfg: Config, args) -> None:
         cfg.max_steps = args.max_steps
     if args.eval_frames_root is not None:
         cfg.eval_frames_root = args.eval_frames_root
+    if args.frames_root is not None:
+        cfg.frames_root = Path(args.frames_root)
 
 
 def _run_one(cfg: Config) -> None:
@@ -182,6 +184,8 @@ def main():
                         help="Stop each epoch after this many steps (for testing)")
     parser.add_argument("--eval-frames-root", type=Path, default=None,
                         help="Validation frames directory for similarity eval")
+    parser.add_argument("--frames-root", type=str, default=None,
+                        help="Training frames directory")
     parser.add_argument("--gpus", type=int, nargs="+", default=None,
                         help="GPU ids to use. Multiple experiments run in parallel across GPUs "
                              "(e.g. --gpus 0 1 assigns experiment 0→cuda:0, experiment 1→cuda:1)")

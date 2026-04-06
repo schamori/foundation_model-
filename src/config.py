@@ -162,7 +162,7 @@ class Config(DataConfig, DINOConfig, VJEPAConfig, TrainConfig):
             else:
                 d[k] = v
         with open(path, "w") as f:
-            json.dump(d, f, indent=2)
+            json.dump(d, f, indent=2) 
 
     @classmethod
     def load(cls, path: Path) -> Config:
