@@ -117,6 +117,8 @@ def _apply_overrides(cfg: Config, args) -> None:
         cfg.eval_frames_root = args.eval_frames_root
     if args.frames_root is not None:
         cfg.frames_root = Path(args.frames_root)
+    if args.num_workers is not None:
+        cfg.num_workers = args.num_workers
 
 
 def _run_one(cfg: Config) -> None:
@@ -188,6 +190,8 @@ def main():
                         help="Validation frames directory for similarity eval")
     parser.add_argument("--frames-root", type=str, default=None,
                         help="Training frames directory")
+    parser.add_argument("--num-workers", type=int, default=None,
+                        help="DataLoader workers (0 = main process, avoids shm issues)")
     parser.add_argument("--gpus", type=int, nargs="+", default=None,
                         help="GPU ids to use. Multiple experiments run in parallel across GPUs "
                              "(e.g. --gpus 0 1 assigns experiment 0→cuda:0, experiment 1→cuda:1)")
