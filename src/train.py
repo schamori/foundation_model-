@@ -127,6 +127,12 @@ def _run_one(cfg: Config) -> None:
         print(f"[FAILED] {cfg.EXPERIMENT_NAME} on {cfg.device}: {e}")
 
 
+def _run_gpu_queue(cfgs: list[Config]) -> None:
+    """Run a list of experiments sequentially (used as subprocess target)."""
+    for cfg in cfgs:
+        _run_one(cfg)
+
+
 def _run_parallel(configs: list[Config], gpus: list[int]) -> None:
     """Distribute experiments round-robin across GPUs and run in parallel."""
     # Assign devices round-robin
@@ -142,10 +148,6 @@ def _run_parallel(configs: list[Config], gpus: list[int]) -> None:
     gpu_groups: dict[str, list[Config]] = defaultdict(list)
     for cfg in configs:
         gpu_groups[cfg.device].append(cfg)
-
-    def _run_gpu_queue(cfgs: list[Config]):
-        for cfg in cfgs:
-            _run_one(cfg)
 
     ctx = mp.get_context("spawn")
     processes = []
