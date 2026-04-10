@@ -1758,7 +1758,10 @@ body{font-family:'IBM Plex Sans',system-ui,sans-serif;background:var(--bg);color
 .ptxt{font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--dim);white-space:nowrap}
 .timeline{height:28px;background:var(--panel);border:1px solid var(--border);border-radius:5px;position:relative;cursor:pointer;overflow:hidden}
 .tl-review{position:absolute;top:0;bottom:0;width:3px;background:#ff3333;z-index:5;pointer-events:none;border-radius:1px;box-shadow:0 0 4px #ff3333,0 0 8px rgba(255,51,51,.5)}
-.tl-blurry{position:absolute;top:0;bottom:0;background:rgba(255,170,51,.3);border:1px solid rgba(255,170,51,.5);z-index:3;pointer-events:none;border-radius:1px}
+.tl-blurry{position:absolute;top:0;bottom:0;background:rgba(255,170,51,.3);border:1px solid rgba(255,170,51,.5);z-index:3;pointer-events:auto;border-radius:1px;cursor:pointer}
+.blurry-preview{position:absolute;bottom:36px;transform:translateX(-50%);background:var(--bg);border:2px solid #ffaa33;border-radius:6px;padding:3px;z-index:200;pointer-events:none;box-shadow:0 4px 16px rgba(0,0,0,.6)}
+.blurry-preview img{display:block;width:200px;border-radius:3px}
+.blurry-preview .bp-label{text-align:center;font-size:10px;color:#ffaa33;padding:2px 0 0;font-family:'JetBrains Mono',monospace}
 .review-active{background:#ff3333!important;border-color:#ff3333!important;color:#fff!important;animation:reviewPulse 1.2s ease-in-out infinite}
 @keyframes reviewPulse{0%,100%{box-shadow:0 0 4px #ff3333}50%{box-shadow:0 0 12px #ff3333,0 0 20px rgba(255,51,51,.4)}}
 .tl-lanes{position:absolute;inset:0}
@@ -1800,6 +1803,7 @@ body{font-family:'IBM Plex Sans',system-ui,sans-serif;background:var(--bg);color
     <button id="playBtn" onclick="togPlay()">▶ play</button>
     <button id="reviewBtn" onclick="toggleReviewMark()" style="background:#2a1a1a;border-color:#5c2020;color:#ff6666;font-weight:700">⚑ Mark review</button>
     <button id="blurryBtn" onclick="toggleBlurry()" style="background:#2a2a1a;border-color:#5c5c20;color:#ffaa33;font-weight:700;font-size:11px">◉ start blurry</button>
+    <button id="delBlurryBtn" onclick="deleteBlurry()" class="hidden" style="background:#3a1a0a;border-color:#7a3a10;color:#ff6622;font-weight:700;font-size:11px">✕ del blurry</button>
     <span class="shortcuts">A/D ±1 · W/S ±10 · Q/E ±60 · Space=play · R=review</span>
   </div>
   <div class="main-area">
@@ -2083,9 +2087,21 @@ document.addEventListener('mouseup',e=>{
 });
 /* drag continues outside canvas — coords clamped to border */
 
+function isBlurry(fi){
+  if(!S.blurryRanges||!S.blurryRanges.length)return false;
+  return S.blurryRanges.some(r=>fi>=r[0]&&fi<=(r[1]!=null?r[1]:Infinity));
+}
 function redr(){
   if(!frameImg)return;ctx.drawImage(frameImg,0,0);
   S.labelRects=[];/* clear label hit areas */
+  /* Blurry frame overlay */
+  if(isBlurry(S.frame)){
+    ctx.fillStyle='rgba(255,170,51,0.15)';ctx.fillRect(0,0,canvas.width,canvas.height);
+    ctx.save();ctx.font='bold 28px IBM Plex Sans,sans-serif';ctx.textAlign='right';ctx.textBaseline='top';
+    ctx.fillStyle='rgba(255,170,51,0.9)';ctx.fillText('BLURRY',canvas.width-16,12);
+    ctx.strokeStyle='rgba(0,0,0,0.5)';ctx.lineWidth=1;ctx.strokeText('BLURRY',canvas.width-16,12);
+    ctx.restore();
+  }
   if(maskImg&&document.getElementById('cbMask').checked){
     ctx.globalAlpha=0.5;ctx.drawImage(maskImg,0,0);ctx.globalAlpha=1;}
   if(document.getElementById('cbBox').checked){
@@ -2330,7 +2346,38 @@ function updBlurryBtn(){
   var hasOpen=S.blurryRanges&&S.blurryRanges.some(r=>r[1]===null);
   btn.textContent=hasOpen?'◉ end blurry':'◉ start blurry';
   btn.style.outline=hasOpen?'2px solid #ffaa33':'none';
+  var delBtn=document.getElementById('delBlurryBtn');if(!delBtn)return;
+  var hasClosed=S.blurryRanges&&S.blurryRanges.some(r=>r[1]!==null);
+  delBtn.classList.toggle('hidden',!hasClosed);
 }
+async function deleteBlurry(){
+  if(!confirm('Delete all closed blurry ranges? Frames will be excluded from allowed_frames.'))return;
+  var r=await fetch('/api/delete_blurry',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+  var d=await r.json();
+  if(d.ok){
+    S.blurryRanges=d.blurry_ranges;
+    if(d.allowed_frames&&d.allowed_frames.length){S.filteredFrames=new Set(d.allowed_frames);S.filteredArray=d.allowed_frames.slice().sort((a,b)=>a-b);}
+    updTimeline();updBlurryBtn();
+    toast('Deleted '+d.deleted_count+' blurry range(s), excluded '+d.excluded_frames+' frames');
+  } else { toast(d.error||'delete failed','err'); }
+}
+var _bpEl=null,_bpCache={};
+function showBlurryPreview(cx,topY,fi,parent){
+  if(!_bpEl){
+    _bpEl=document.createElement('div');_bpEl.className='blurry-preview';
+    _bpEl.innerHTML='<img><div class="bp-label"></div>';
+    document.body.appendChild(_bpEl);
+  }
+  _bpEl.style.display='block';
+  _bpEl.style.left=cx+'px';_bpEl.style.top=(topY-10)+'px';
+  _bpEl.style.transform='translate(-50%,-100%)';
+  var img=_bpEl.querySelector('img');
+  var lbl=_bpEl.querySelector('.bp-label');
+  lbl.textContent='frame '+fi;
+  if(_bpCache[fi]){img.src=_bpCache[fi];}
+  else{var src='/api/frame/'+fi;_bpCache[fi]=src;img.src=src;}
+}
+function hideBlurryPreview(){if(_bpEl)_bpEl.style.display='none';}
 
 async function startTrack(){
   if(!S.boxes.length||S.tracking)return;
@@ -2413,7 +2460,7 @@ function updTimeline(){
       lanesEl.appendChild(div);
     });
   }
-  /* Paint blurry ranges — orange bars */
+  /* Paint blurry ranges — orange bars with hover preview */
   if(S.blurryRanges&&S.blurryRanges.length&&S.total>0){
     S.blurryRanges.forEach(r=>{
       var s0=r[0],s1=r[1]!=null?r[1]:S.total;
@@ -2421,7 +2468,22 @@ function updTimeline(){
       div.className='tl-blurry';
       div.style.left=((s0/S.total)*100)+'%';
       div.style.width=(((s1-s0)/S.total)*100)+'%';
-      div.title='blurry '+s0+'-'+s1;
+      div.title='';
+      div.addEventListener('mousemove',function(ev){
+        var rect=this.getBoundingClientRect();
+        var frac=(ev.clientX-rect.left)/rect.width;
+        var fi=Math.round(s0+frac*(s1-s0));
+        fi=Math.max(s0,Math.min(fi,s1));
+        showBlurryPreview(ev.clientX,rect.top,fi,this);
+      });
+      div.addEventListener('mouseleave',hideBlurryPreview);
+      div.addEventListener('click',function(ev){
+        ev.stopPropagation();
+        var rect=this.getBoundingClientRect();
+        var frac=(ev.clientX-rect.left)/rect.width;
+        var fi=Math.round(s0+frac*(s1-s0));
+        loadFrame(Math.max(s0,Math.min(fi,s1)));
+      });
       lanesEl.appendChild(div);
     });
   }
@@ -3060,6 +3122,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(404)
 
     def do_POST(self):
+        global VIDEO_PATH
         p = self.path.split("?")[0]
         body = self._body()
         if p == "/api/track":
@@ -3145,6 +3208,37 @@ class Handler(BaseHTTPRequestHandler):
             s.blurry_ranges.append([si, None])
             self.tracker._autosave_debounced()
             self._json({"ok": True, "open": True, "blurry_ranges": s.blurry_ranges})
+        elif p == "/api/delete_blurry":
+            s = self.tracker.state
+            # Collect closed blurry ranges and append to custom.txt
+            closed = [r for r in s.blurry_ranges if r[1] is not None]
+            if not closed:
+                self._json({"ok": False, "error": "no closed blurry ranges"})
+                return
+            adir = self.tracker.autosave_dir
+            adir.mkdir(parents=True, exist_ok=True)
+            custom = adir / "custom.txt"
+            with open(custom, "a") as f:
+                for r in closed:
+                    f.write(f"{r[0]} {r[1]}\n")
+            # Remove closed ranges from state (keep open ones)
+            s.blurry_ranges = [r for r in s.blurry_ranges if r[1] is None]
+            self.tracker._autosave_debounced()
+            # Refresh allowed_frames
+            vp = VIDEO_PATH
+            frames = _load_allowed_frames(FILTERED_FRAMES_ROOT, self.video, vp.stem if vp else None)
+            frames = _apply_custom_exclusions(frames, adir)
+            Handler.allowed_frames = frames
+            _save_allowed_frames_cache(adir, frames, _count_filtered_images(FILTERED_FRAMES_ROOT, vp.stem) if vp else None)
+            n_excluded = sum(r[1] - r[0] + 1 for r in closed)
+            print(f"[blurry] Deleted {len(closed)} ranges ({n_excluded} frames) → custom.txt")
+            self._json({
+                "ok": True,
+                "blurry_ranges": s.blurry_ranges,
+                "allowed_frames": Handler.allowed_frames,
+                "deleted_count": len(closed),
+                "excluded_frames": n_excluded,
+            })
         elif p == "/api/delete_object":
             d = json.loads(body)
             ok = self.tracker.delete_object(int(d["oid"]))
@@ -3167,7 +3261,6 @@ class Handler(BaseHTTPRequestHandler):
                 Handler.tracker.reset_for_video(new_autosave_dir)
                 Handler.video = new_video
                 Handler.temporal_clips = []
-                global VIDEO_PATH
                 VIDEO_PATH = vpath
                 _save_last_video(vpath)
 

@@ -11,7 +11,20 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import sys
+import time
 import torch
+
+
+def _fmt_time(seconds: float) -> str:
+    """Format seconds as human-readable h/m/s string."""
+    s = int(seconds)
+    if s < 60:
+        return f"{s}s"
+    m, s = divmod(s, 60)
+    if m < 60:
+        return f"{m}m {s}s"
+    h, m = divmod(m, 60)
+    return f"{h}h {m}m {s}s"
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -61,11 +74,19 @@ class Trainer:
 
         steps_per_epoch = len(self.loader)
 
+        is_tty = sys.stdout.isatty()
+        log_interval = max(1, steps_per_epoch // 5)  # log ~5 times per epoch
+
         for epoch in range(self.start_epoch, cfg.epochs):
             self._apply_epoch_schedules(epoch)
+            epoch_t0 = time.time()
+
+            if not is_tty:
+                print(f"[trainer] Epoch {epoch + 1}/{cfg.epochs} starting "
+                      f"({steps_per_epoch} steps)", flush=True)
 
             total_loss = 0.0
-            pbar = tqdm(self.loader, desc=f"Epoch {epoch + 1}/{cfg.epochs}", disable=not sys.stdout.isatty())
+            pbar = tqdm(self.loader, desc=f"Epoch {epoch + 1}/{cfg.epochs}", disable=not is_tty)
 
             for step, batch in enumerate(pbar):
                 if cfg.max_steps is not None and step >= cfg.max_steps:
@@ -87,8 +108,23 @@ class Trainer:
                 total_loss += loss
                 pbar.set_postfix(loss=f"{loss:.4f}", lr=f"{lr:.2e}")
 
-            avg_loss = total_loss / steps_per_epoch
-            print(f"[trainer] Epoch {epoch + 1} — avg loss: {avg_loss:.4f}")
+                if not is_tty and (step + 1) % log_interval == 0:
+                    elapsed = time.time() - epoch_t0
+                    eta = elapsed / (step + 1) * (steps_per_epoch - step - 1)
+                    avg_so_far = total_loss / (step + 1)
+                    print(f"[trainer]   step {step + 1}/{steps_per_epoch} — "
+                          f"loss: {loss:.4f} (avg: {avg_so_far:.4f}), "
+                          f"lr: {lr:.2e}, "
+                          f"elapsed: {_fmt_time(elapsed)}, eta: {_fmt_time(eta)}", flush=True)
+
+            epoch_time = time.time() - epoch_t0
+            actual_steps = min(step + 1, cfg.max_steps) if cfg.max_steps else steps_per_epoch
+            avg_loss = total_loss / actual_steps
+            remaining_epochs = cfg.epochs - epoch - 1
+            remaining_time = epoch_time * remaining_epochs
+            print(f"[trainer] Epoch {epoch + 1} — avg loss: {avg_loss:.4f}, "
+                  f"time: {_fmt_time(epoch_time)}, "
+                  f"est. remaining: {_fmt_time(remaining_time)}")
 
             # Checkpoint
             if (epoch + 1) % cfg.save_freq == 0 or epoch == cfg.epochs - 1:
