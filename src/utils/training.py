@@ -42,8 +42,11 @@ class Trainer:
         self.method = method
         self.loader = dataloader
         self.cfg = cfg
+        self.debug = cfg.debug
 
         # Optimizer
+        if self.debug:
+            print("[debug] Creating optimizer...", flush=True)
         self.optimizer = torch.optim.AdamW(
             method.student_parameters(),
             lr=cfg.base_lr,
@@ -52,11 +55,15 @@ class Trainer:
         self.scaler = torch.amp.GradScaler(enabled=cfg.use_fp16)
 
         # Schedules
+        if self.debug:
+            print("[debug] Building LR/EMA/WD/temp schedules...", flush=True)
         steps_per_epoch = len(dataloader)
         self.lr_sched = lr_schedule(cfg, steps_per_epoch)
         self.ema_sched = ema_momentum_schedule(cfg)
         self.wd_sched = weight_decay_schedule(cfg)
         self.temp_sched = teacher_temp_schedule(cfg)
+        if self.debug:
+            print("[debug] Trainer init complete", flush=True)
 
         self.start_epoch = 0
 
@@ -86,9 +93,15 @@ class Trainer:
                       f"({steps_per_epoch} steps)", flush=True)
 
             total_loss = 0.0
+            if self.debug:
+                print(f"[debug] Creating DataLoader iterator...", flush=True)
             pbar = tqdm(self.loader, desc=f"Epoch {epoch + 1}/{cfg.epochs}", disable=not is_tty)
 
             for step, batch in enumerate(pbar):
+                if self.debug and step == 0:
+                    print(f"[debug] First batch loaded successfully "
+                          f"(keys={list(batch.keys()) if isinstance(batch, dict) else type(batch).__name__})",
+                          flush=True)
                 if cfg.max_steps is not None and step >= cfg.max_steps:
                     break
 
@@ -99,7 +112,11 @@ class Trainer:
                 for pg in self.optimizer.param_groups:
                     pg["lr"] = lr
 
+                if self.debug and step == 0:
+                    print(f"[debug] Running first train_step...", flush=True)
                 loss = self.method.train_step(batch, self.optimizer, self.scaler, epoch)
+                if self.debug and step == 0:
+                    print(f"[debug] First step done, loss={loss:.4f}", flush=True)
 
                 # EMA teacher update
                 momentum = float(self.ema_sched[epoch])

@@ -45,8 +45,13 @@ EXPERIMENTS = {
 
 def build_dataloader(cfg: Config, method) -> DataLoader:
     """Build dataset and dataloader for the configured method."""
+    debug = cfg.debug
+    if debug:
+        print("[debug] Building augmentation...", flush=True)
     transform = build_augmentation(cfg)
 
+    if debug:
+        print(f"[debug] Building dataset (frames_root={cfg.frames_root})...", flush=True)
     dataset = SurgicalFrameDataset(
         frames_root=cfg.frames_root,
         exclude_folders=cfg.exclude_folders,
@@ -61,9 +66,14 @@ def build_dataloader(cfg: Config, method) -> DataLoader:
         clip_stride=cfg.clip_stride,
     )
 
+    if debug:
+        print(f"[debug] Building sampler ({len(dataset)} samples)...", flush=True)
     sampler = dataset.sampler()
 
-    return DataLoader(
+    if debug:
+        print(f"[debug] Creating DataLoader (batch_size={cfg.batch_size}, "
+              f"num_workers={cfg.num_workers}, pin_memory=True)...", flush=True)
+    loader = DataLoader(
         dataset,
         batch_size=cfg.batch_size,
         sampler=sampler,
@@ -72,6 +82,9 @@ def build_dataloader(cfg: Config, method) -> DataLoader:
         pin_memory=True,
         drop_last=True,
     )
+    if debug:
+        print(f"[debug] DataLoader ready ({len(loader)} steps/epoch)", flush=True)
+    return loader
 
 
 def run_experiment(cfg: Config) -> None:
@@ -84,18 +97,30 @@ def run_experiment(cfg: Config) -> None:
     print(f"  Batch size: {cfg.batch_size}")
     print(f"{'=' * 60}\n")
 
+    debug = cfg.debug
+
     # Set seed
     torch.manual_seed(cfg.seed)
 
     # Build method
+    if debug:
+        print("[debug] Building SSL method...", flush=True)
     method = get_ssl_method(cfg)
+    if debug:
+        print("[debug] Calling method.build()...", flush=True)
     method.build(cfg)
+    if debug:
+        print("[debug] Method ready", flush=True)
 
     # Build dataloader
     loader = build_dataloader(cfg, method)
 
     # Train
+    if debug:
+        print("[debug] Creating Trainer...", flush=True)
     trainer = Trainer(method, loader, cfg)
+    if debug:
+        print("[debug] Starting training loop...", flush=True)
     trainer.train()
 
 
@@ -119,6 +144,8 @@ def _apply_overrides(cfg: Config, args) -> None:
         cfg.frames_root = Path(args.frames_root)
     if args.num_workers is not None:
         cfg.num_workers = args.num_workers
+    if hasattr(args, "debug") and args.debug:
+        cfg.debug = True
 
 
 def _run_one(cfg: Config) -> None:
@@ -195,6 +222,8 @@ def main():
     parser.add_argument("--gpus", type=int, nargs="+", default=None,
                         help="GPU ids to use. Multiple experiments run in parallel across GPUs "
                              "(e.g. --gpus 0 1 assigns experiment 0→cuda:0, experiment 1→cuda:1)")
+    parser.add_argument("--debug", action="store_true",
+                        help="Verbose logging for debugging hangs/startup issues")
 
     args = parser.parse_args()
 
