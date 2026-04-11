@@ -13,6 +13,7 @@ import random
 from collections import defaultdict
 from pathlib import Path
 
+import cv2
 import numpy as np
 from PIL import Image
 from torch.utils.data import Dataset, WeightedRandomSampler
@@ -20,6 +21,16 @@ from torch.utils.data import Dataset, WeightedRandomSampler
 from ..utils.augmentations import PoolAwareMultiCropAugmentation
 
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp"}
+
+
+def _read_image(path: Path) -> Image.Image:
+    """Read an image using cv2 (faster JPEG decoding) and return as PIL RGB."""
+    buf = np.fromfile(str(path), dtype=np.uint8)
+    bgr = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+    if bgr is None:
+        return Image.open(path).convert("RGB")
+    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    return Image.fromarray(rgb)
 
 
 # ---------------------------------------------------------------------------
@@ -148,10 +159,7 @@ class SurgicalFrameDataset(Dataset):
     def _getitem_dino(self, idx: int):
         """Return augmentation pool for DINO training."""
         pool = self._build_augmentation_pool(idx)
-        images = []
-        for p in pool:
-            with Image.open(p) as img:
-                images.append(img.convert("RGB"))
+        images = [_read_image(p) for p in pool]
 
         if self.transform is not None:
             # PoolAwareMultiCropAugmentation expects list, MultiCropAugmentation expects single image
@@ -200,10 +208,8 @@ class SurgicalFrameDataset(Dataset):
         for i in range(self.clip_length):
             fi = local_start + i * self.clip_stride
             if fi < len(v_indices):
-                with Image.open(self._frames[v_indices[fi]]) as img:
-                    clip_images.append(img.convert("RGB"))
+                clip_images.append(_read_image(self._frames[v_indices[fi]]))
             else:
-                # Repeat last frame if clip extends beyond video
                 clip_images.append(clip_images[-1].copy())
 
         if self.transform is not None:

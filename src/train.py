@@ -81,6 +81,8 @@ def build_dataloader(cfg: Config, method) -> DataLoader:
         collate_fn=method.collate_fn,
         pin_memory=True,
         drop_last=True,
+        persistent_workers=cfg.num_workers > 0,
+        prefetch_factor=3 if cfg.num_workers > 0 else None,
     )
     if debug:
         print(f"[debug] DataLoader ready ({len(loader)} steps/epoch)", flush=True)

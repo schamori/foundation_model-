@@ -3,7 +3,7 @@
   "min_lr": 1e-06,
   "weight_decay": 0.04,
   "weight_decay_end": 0.4,
-  "epochs": 1,
+  "epochs": 100,
   "batch_size": 25,
   "ema_momentum": 0.996,
   "ema_momentum_end": 1.0,
@@ -21,7 +21,7 @@
   "seed": 42,
   "device": "cuda:0",
   "resume_from": null,
-  "max_steps": 5000,
+  "max_steps": null,
   "knn_labels_root": null,
   "evaluators": [
     "similarity"
