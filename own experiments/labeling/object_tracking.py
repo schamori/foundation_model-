@@ -40,6 +40,7 @@ PORT          = 8766
 SAMPLE_FPS    = 1
 TRACK_SECONDS = 50
 SAM2_HF_ID   = "facebook/sam2-hiera-large"
+DEVICE        = "cuda:1"   # "cuda:0" or "cuda:1"
 PROJECT_ROOT  = Path(__file__).resolve().parents[2]
 EXPORT_DIR    = PROJECT_ROOT / "tracking_exports"
 AUTOSAVE_DIR  = None   # computed once a video is loaded
@@ -903,8 +904,8 @@ def _cap_duration_to_clip(video, start_sample: int, duration: int, clips: list) 
 def _load_predictor():
     try:
         from sam2.sam2_video_predictor import SAM2VideoPredictor
-        print(f"[sam2] Loading {SAM2_HF_ID} …")
-        p = SAM2VideoPredictor.from_pretrained(SAM2_HF_ID)
+        print(f"[sam2] Loading {SAM2_HF_ID} on {DEVICE} …")
+        p = SAM2VideoPredictor.from_pretrained(SAM2_HF_ID, device=DEVICE)
         print("[sam2] Loaded ✓")
         return p
     except Exception as e:
@@ -914,7 +915,7 @@ def _load_predictor():
         ckpt = globals().get("SAM2_CHECKPOINT")
         if cfg and ckpt:
             from sam2.build_sam import build_sam2_video_predictor
-            p = build_sam2_video_predictor(cfg, ckpt)
+            p = build_sam2_video_predictor(cfg, ckpt, device=DEVICE)
             print("[sam2] Loaded (local) ✓")
             return p
     except Exception as e:
@@ -922,7 +923,8 @@ def _load_predictor():
     return None
 
 def _autocast_dtype():
-    if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8:
+    dev_idx = int(DEVICE.split(":")[-1]) if ":" in DEVICE else 0
+    if torch.cuda.is_available() and torch.cuda.get_device_capability(dev_idx)[0] >= 8:
         return torch.bfloat16
     return torch.float16
 
@@ -1223,7 +1225,7 @@ class SAM2Tracker:
         s.phase = "embedding"
         self._tmp = None
         dtype = _autocast_dtype()
-        with torch.inference_mode(), torch.autocast("cuda", dtype=dtype):
+        with torch.inference_mode(), torch.autocast(DEVICE.split(":")[0], dtype=dtype):
             inf = self._build_inference_state(video, start_from, n_frames)
             box = np.array(bbox, dtype=np.float32)
             self.predictor.add_new_points_or_box(
@@ -1619,7 +1621,7 @@ class SAM2Tracker:
             s.phase = "embedding"
             self._tmp = None
             dtype = _autocast_dtype()
-            with torch.inference_mode(), torch.autocast("cuda", dtype=dtype):
+            with torch.inference_mode(), torch.autocast(DEVICE.split(":")[0], dtype=dtype):
                 inf = self._build_inference_state(video, sample_idx, n_frames)
 
                 for i, binfo in enumerate(boxes):

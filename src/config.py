@@ -132,6 +132,7 @@ class TrainConfig:
     resume_from: Optional[Path] = None
     max_steps: Optional[int] = None
     knn_labels_root: Optional[Path] = None   # class-structured dir for k-NN eval
+    evaluators: list[str] = field(default_factory=lambda: ["similarity"])
     debug: bool = False
 
 

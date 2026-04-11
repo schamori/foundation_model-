@@ -144,6 +144,8 @@ def _apply_overrides(cfg: Config, args) -> None:
         cfg.frames_root = Path(args.frames_root)
     if args.num_workers is not None:
         cfg.num_workers = args.num_workers
+    if args.evaluators is not None:
+        cfg.evaluators = args.evaluators
     if hasattr(args, "debug") and args.debug:
         cfg.debug = True
 
@@ -222,6 +224,8 @@ def main():
     parser.add_argument("--gpus", type=int, nargs="+", default=None,
                         help="GPU ids to use. Multiple experiments run in parallel across GPUs "
                              "(e.g. --gpus 0 1 assigns experiment 0→cuda:0, experiment 1→cuda:1)")
+    parser.add_argument("--evaluators", type=str, nargs="+", default=None,
+                        help="Which evaluators to run (e.g. similarity cross_video_retrieval knn)")
     parser.add_argument("--debug", action="store_true",
                         help="Verbose logging for debugging hangs/startup issues")
 

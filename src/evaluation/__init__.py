@@ -59,7 +59,11 @@ def run_all_evaluations(cfg: Config, checkpoint_path: Path, epoch: int) -> dict:
     """
     all_metrics: dict[str, dict] = {}
 
+    enabled = set(cfg.evaluators) if cfg.evaluators else {e.name for e in _EVALUATORS}
+
     for evaluator_cls in _EVALUATORS:
+        if evaluator_cls.name not in enabled:
+            continue
         try:
             evaluator = evaluator_cls(cfg)
             metrics = evaluator.evaluate_checkpoint(checkpoint_path, epoch)

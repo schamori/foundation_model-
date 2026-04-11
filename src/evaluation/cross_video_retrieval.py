@@ -62,8 +62,16 @@ def _cross_video_retrieval(
     """
     import faiss
 
+    # Free GPU memory from training/embedding extraction before FAISS
+    if "cuda" in device:
+        torch.cuda.empty_cache()
+
     use_gpu = "cuda" in device and hasattr(faiss, "StandardGpuResources")
-    gpu_res = faiss.StandardGpuResources() if use_gpu else None
+    gpu_res = None
+    if use_gpu:
+        gpu_res = faiss.StandardGpuResources()
+        # Limit FAISS temp memory to 512 MB to avoid OOM
+        gpu_res.setTempMemory(512 * 1024 * 1024)
 
     video_keys = sorted(video_embs.keys())
     vid_surgery = [_surgery_type(vk) for vk in video_keys]
@@ -109,8 +117,12 @@ def _cross_video_retrieval(
 
         cpu_index = faiss.IndexFlatIP(d)
         cpu_index.add(other_embs)
-        other_index = faiss.index_cpu_to_gpu(gpu_res, 0, cpu_index) if use_gpu else cpu_index
-        D, I = other_index.search(q_embs, 1)
+        # Use CPU for large indices to avoid FAISS GPU OOM / CUBLAS assertion
+        if use_gpu and other_embs.nbytes < 256 * 1024 * 1024:  # <256 MB
+            other_index = faiss.index_cpu_to_gpu(gpu_res, 0, cpu_index)
+            D, I = other_index.search(q_embs, 1)
+        else:
+            D, I = cpu_index.search(q_embs, 1)
 
         q_stype = vid_surgery[vi]
         for qi_local in range(len(q_embs)):
@@ -277,6 +289,10 @@ class CrossVideoRetrievalEvaluator(BaseEvaluator):
                       "note": f"only {len(video_embs)} videos with embeddings, need >=2"}
             self.results.append(result)
             return result
+
+        # Free backbone GPU memory before FAISS retrieval
+        del backbone
+        torch.cuda.empty_cache()
 
         beta = getattr(self.cfg, "retrieval_beta", 0.0)
         retrieval = _cross_video_retrieval(video_embs, video_phases, device=device, beta=beta)

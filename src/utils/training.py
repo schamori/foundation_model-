@@ -174,3 +174,4 @@ class Trainer:
             print(f"[trainer] Eval epoch {epoch}: {metrics}")
         except Exception as e:
             print(f"[trainer] Eval failed: {e}")
+
