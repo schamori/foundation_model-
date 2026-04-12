@@ -148,6 +148,8 @@ def _apply_overrides(cfg: Config, args) -> None:
         cfg.num_workers = args.num_workers
     if args.evaluators is not None:
         cfg.evaluators = args.evaluators
+    if hasattr(args, "no_wandb") and args.no_wandb:
+        cfg.use_wandb = False
     if hasattr(args, "debug") and args.debug:
         cfg.debug = True
 
@@ -228,6 +230,8 @@ def main():
                              "(e.g. --gpus 0 1 assigns experiment 0→cuda:0, experiment 1→cuda:1)")
     parser.add_argument("--evaluators", type=str, nargs="+", default=None,
                         help="Which evaluators to run (e.g. similarity cross_video_retrieval knn)")
+    parser.add_argument("--no-wandb", action="store_true",
+                        help="Disable wandb logging")
     parser.add_argument("--debug", action="store_true",
                         help="Verbose logging for debugging hangs/startup issues")
 

@@ -65,6 +65,24 @@ class Trainer:
         if self.debug:
             print("[debug] Trainer init complete", flush=True)
 
+        # Wandb
+        self.wandb = None
+        if cfg.use_wandb:
+            try:
+                import wandb
+                wandb.init(
+                    project=cfg.wandb_project,
+                    name=cfg.EXPERIMENT_NAME,
+                    config={k: str(v) if isinstance(v, Path) else v
+                            for k, v in cfg.__dict__.items()
+                            if not k.startswith("_")},
+                    resume="allow",
+                )
+                self.wandb = wandb
+                print(f"[wandb] Logging to {wandb.run.url}")
+            except Exception as e:
+                print(f"[wandb] Init failed: {e} — continuing without wandb")
+
         self.start_epoch = 0
 
         # Resume
@@ -125,6 +143,13 @@ class Trainer:
                 total_loss += loss
                 pbar.set_postfix(loss=f"{loss:.4f}", lr=f"{lr:.2e}")
 
+                if self.wandb:
+                    self.wandb.log({
+                        "train/loss": loss,
+                        "train/lr": lr,
+                        "train/ema_momentum": momentum,
+                    }, step=global_step)
+
                 if not is_tty and (step + 1) % log_interval == 0:
                     elapsed = time.time() - epoch_t0
                     eta = elapsed / (step + 1) * (steps_per_epoch - step - 1)
@@ -142,6 +167,14 @@ class Trainer:
             print(f"[trainer] Epoch {epoch + 1} — avg loss: {avg_loss:.4f}, "
                   f"time: {_fmt_time(epoch_time)}, "
                   f"est. remaining: {_fmt_time(remaining_time)}")
+
+            if self.wandb:
+                self.wandb.log({
+                    "epoch/avg_loss": avg_loss,
+                    "epoch/time_seconds": epoch_time,
+                    "epoch/remaining_seconds": remaining_time,
+                    "epoch": epoch + 1,
+                }, step=(epoch + 1) * steps_per_epoch)
 
             # Checkpoint
             if (epoch + 1) % cfg.save_freq == 0 or epoch == cfg.epochs - 1:
@@ -172,6 +205,21 @@ class Trainer:
             from ..evaluation import run_all_evaluations
             metrics = run_all_evaluations(self.cfg, ckpt_path, epoch)
             print(f"[trainer] Eval epoch {epoch}: {metrics}")
+
+            if self.wandb:
+                flat = {}
+                for eval_name, eval_metrics in metrics.items():
+                    if isinstance(eval_metrics, dict):
+                        for k, v in eval_metrics.items():
+                            if isinstance(v, (int, float)):
+                                flat[f"eval/{eval_name}/{k}"] = v
+                            elif isinstance(v, dict):
+                                for kk, vv in v.items():
+                                    if isinstance(vv, (int, float)):
+                                        flat[f"eval/{eval_name}/{k}/{kk}"] = vv
+                if flat:
+                    flat["epoch"] = epoch
+                    self.wandb.log(flat, step=epoch * len(self.loader))
         except Exception as e:
             print(f"[trainer] Eval failed: {e}")
 

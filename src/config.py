@@ -133,6 +133,8 @@ class TrainConfig:
     max_steps: Optional[int] = None
     knn_labels_root: Optional[Path] = None   # class-structured dir for k-NN eval
     evaluators: list[str] = field(default_factory=lambda: ["similarity"])
+    use_wandb: bool = True
+    wandb_project: str = "foundential-model"
     debug: bool = False
 
 
