@@ -10,7 +10,8 @@ Usage:
     python -m src.train --config output/my_experiment/config.json
 """
 
-from __future__ import annotations
+import torch.multiprocessing
+torch.multiprocessing.set_sharing_strategy('file_system')
 
 import argparse
 import multiprocessing as mp
