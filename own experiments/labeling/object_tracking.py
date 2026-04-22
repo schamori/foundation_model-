@@ -32,6 +32,14 @@ import numpy as np
 import cv2
 import torch
 
+# Pluggable inference backend (YOLO and future model families).
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+try:
+    import inference as infer_mod
+except Exception as _e:
+    print(f"[inference] module unavailable: {_e}")
+    infer_mod = None
+
 # ═══════════════════════════════════════════════════════════════
 #  CONFIG
 # ═══════════════════════════════════════════════════════════════
@@ -1834,6 +1842,29 @@ body{font-family:'IBM Plex Sans',system-ui,sans-serif;background:var(--bg);color
     <button id="expDat" class="btn-export hidden" onclick="doExp('data')">export data</button>
     <button id="rstBtn" class="btn-danger hidden" onclick="rstAll()">reset all</button>
     <label id="cbTempLbl" class="hidden" title="Restrict navigation to top temporal clips"><input type="checkbox" id="cbTemp" onchange="onTemporalToggle()"> ⚡ temporal only</label>
+    <button id="infBtn" onclick="openInfModal()" style="background:#1a2a3a;border-color:#2a5c88;color:#8cf" title="Overlay model predictions">🤖 Inference model</button>
+    <label id="infToggleLbl" class="hidden" title="Show model predictions on current frame"><input type="checkbox" id="cbInf" onchange="onInfToggle()"> 🤖 show preds</label>
+    <span id="infLabel" class="hidden" style="font-size:10px;color:#8cf;font-family:monospace;white-space:nowrap;max-width:240px;overflow:hidden;text-overflow:ellipsis"></span>
+  </div>
+  <div id="infModal" class="hidden" style="position:fixed;inset:0;background:rgba(0,0,0,0.65);z-index:100;display:flex;align-items:center;justify-content:center">
+    <div style="background:#1a1a1a;border:1px solid #333;border-radius:8px;padding:18px;min-width:480px;max-width:640px;max-height:80vh;overflow-y:auto;color:#eee;font-family:IBM Plex Sans,sans-serif">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+        <h3 style="margin:0;font-size:15px;color:#8cf">Inference model</h3>
+        <button onclick="closeInfModal()" style="background:transparent;color:#999;border:none;font-size:18px;cursor:pointer">×</button>
+      </div>
+      <div id="infStatus" style="font-size:11px;color:#aaa;margin-bottom:10px;font-family:monospace"></div>
+      <div style="font-size:12px;color:#aaa;margin-bottom:6px">Pick a weight file:</div>
+      <div id="infList" style="border:1px solid #333;border-radius:4px;max-height:260px;overflow-y:auto;margin-bottom:10px"></div>
+      <div style="display:flex;gap:10px;align-items:center;margin-bottom:10px;font-size:12px">
+        <label>conf <input type="number" id="infConf" value="0.25" min="0" max="1" step="0.05" style="width:60px;background:#222;color:#eee;border:1px solid #444;padding:2px 4px"></label>
+        <label>device <input type="text" id="infDevice" value="" placeholder="auto (cuda/cpu)" style="width:120px;background:#222;color:#eee;border:1px solid #444;padding:2px 4px"></label>
+      </div>
+      <div style="display:flex;gap:6px;justify-content:flex-end">
+        <button onclick="closeInfModal()" style="background:#333;color:#eee;border:1px solid #555;padding:6px 12px;border-radius:4px;cursor:pointer">Cancel</button>
+        <button id="infUnloadBtn" onclick="unloadInf()" class="hidden" style="background:#4a2222;color:#eee;border:1px solid #722;padding:6px 12px;border-radius:4px;cursor:pointer">Unload</button>
+        <button id="infLoadBtn" onclick="loadInf()" disabled style="background:#2a5c88;color:#fff;border:1px solid #3a7cb0;padding:6px 12px;border-radius:4px;cursor:pointer">Load</button>
+      </div>
+    </div>
   </div>
   <div class="actions hidden" id="progRow">
     <div class="pbar-wrap"><div class="pbar"><div class="pfill" id="pFill"></div></div>
@@ -1852,7 +1883,8 @@ var S={frame:0,total:0,vw:0,vh:0,boxes:[],activeLabel:'',activeColor:'',
   instruments:[],tracked:null,fdCache:{},maskCache:{},tracking:false,playTimer:null,
   allObjects:{},labelRects:[],bboxRanges:null,bboxRangesInFlight:false,
   temporalClips:null,temporalOnly:false,clickPoints:[],filteredFrames:null,filteredArray:null,
-  reviewMarks:new Set(),blurryRanges:[]};
+  reviewMarks:new Set(),blurryRanges:[],
+  infOn:false,infBoxes:[],infLoaded:false,infMeta:null,infFrame:-1,infInFlight:false,infSelected:null};
 var canvas=document.getElementById('canvas'),ctx=canvas.getContext('2d');
 var frameImg=null,maskImg=null,drag=null;
 
@@ -1922,6 +1954,7 @@ async function loadFrame(n){
   n=nearestAllowed(n);
   S.frame=n;
   saveFrameDebounced();
+  if(S.infOn)requestInference(n);
   document.getElementById('fIn').value=n;
   document.getElementById('iFrame').textContent=n;
   document.getElementById('iTime').textContent=n+'s';
@@ -2130,6 +2163,21 @@ function redr(){
     ctx.font='bold 13px IBM Plex Sans,sans-serif';ctx.fillStyle=S.activeColor||'#fff';
     ctx.fillText((4-S.clickPoints.length)+' more clicks',px1+4,py1>18?py1-6:py2+16);
   }
+  if(S.infOn&&S.infBoxes&&S.infBoxes.length){drawInfBoxes();}
+}
+function drawInfBoxes(){
+  ctx.save();ctx.lineWidth=3;ctx.setLineDash([4,3]);
+  ctx.font='bold 12px IBM Plex Sans,sans-serif';
+  for(var i=0;i<S.infBoxes.length;i++){
+    var b=S.infBoxes[i];var box=b.bbox;var col='#00e5ff';
+    ctx.strokeStyle=col;ctx.strokeRect(box[0],box[1],box[2]-box[0],box[3]-box[1]);
+    var txt='🤖 '+b.label+' '+(b.score*100|0)+'%';
+    var tw=ctx.measureText(txt).width+8,th=16;
+    var ly=box[1]>th+3?box[1]-th-1:box[3]+1;
+    ctx.fillStyle='rgba(0,120,160,0.85)';ctx.fillRect(box[0],ly,tw,th);
+    ctx.fillStyle='#fff';ctx.fillText(txt,box[0]+4,ly+12);
+  }
+  ctx.setLineDash([]);ctx.restore();
 }
 function drawTBox(x1,y1,x2,y2,col,lbl,ca,oid){
   var dLbl='#'+oid+' '+lbl;
@@ -2644,6 +2692,84 @@ function rstAll(){
   toast('Reset');
 }
 
+// ── Inference model (YOLO / pluggable) ────────────────────────────────
+async function openInfModal(){
+  document.getElementById('infModal').classList.remove('hidden');
+  document.getElementById('infStatus').textContent='scanning weights…';
+  try{
+    var r=await fetch('/api/inference/models');var d=await r.json();
+    renderInfList(d.models||[],d.loaded||{});
+    var cur=d.is_loaded?('loaded: '+(d.loaded.path||'?')):'no model loaded';
+    document.getElementById('infStatus').textContent=cur;
+    document.getElementById('infUnloadBtn').classList.toggle('hidden',!d.is_loaded);
+  }catch(e){document.getElementById('infStatus').textContent='error: '+e;}
+}
+function closeInfModal(){document.getElementById('infModal').classList.add('hidden');}
+function renderInfList(rows,loaded){
+  var el=document.getElementById('infList');
+  if(!rows.length){el.innerHTML='<div style="padding:10px;color:#888;font-size:12px">No weights found under output/end_tasks/*/yolo*/weights/*.pt — train a model first.</div>';return;}
+  var html='';
+  for(var i=0;i<rows.length;i++){
+    var r=rows[i];var isCur=loaded&&loaded.path===r.path;
+    var bg=isCur?'#2a3a4a':'transparent';
+    html+='<div data-idx="'+i+'" onclick="selectInfRow(this,'+i+')" style="padding:7px 10px;border-bottom:1px solid #222;cursor:pointer;background:'+bg+';font-family:monospace;font-size:11px">'+
+      '<div style="color:#8cf;font-weight:600">'+r.experiment+' · '+r.run+' · '+r.file+'</div>'+
+      '<div style="color:#888;margin-top:2px">'+r.path+' ('+r.size_mb+' MB · '+r.kind+')</div>'+
+      '</div>';
+  }
+  el.innerHTML=html;S.infRows=rows;
+  document.getElementById('infLoadBtn').disabled=true;S.infSelected=null;
+}
+function selectInfRow(el,i){
+  document.querySelectorAll('#infList > div').forEach(d=>d.style.background='transparent');
+  el.style.background='#2a3a4a';
+  S.infSelected=S.infRows[i];
+  document.getElementById('infLoadBtn').disabled=false;
+}
+async function loadInf(){
+  if(!S.infSelected)return;
+  var btn=document.getElementById('infLoadBtn');btn.disabled=true;btn.textContent='loading…';
+  try{
+    var r=await fetch('/api/inference/load',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({path:S.infSelected.path,kind:S.infSelected.kind,
+        device:document.getElementById('infDevice').value||null})});
+    var d=await r.json();
+    if(!d.ok){toast('load failed: '+(d.error||''),true);btn.textContent='Load';btn.disabled=false;return;}
+    S.infLoaded=true;S.infMeta=d.meta;
+    document.getElementById('infToggleLbl').classList.remove('hidden');
+    document.getElementById('infLabel').classList.remove('hidden');
+    document.getElementById('infLabel').textContent='🤖 '+S.infSelected.experiment+'/'+S.infSelected.file;
+    document.getElementById('cbInf').checked=true;S.infOn=true;
+    closeInfModal();toast('Model loaded');
+    requestInference(S.frame);
+  }catch(e){toast('load error: '+e,true);btn.textContent='Load';btn.disabled=false;}
+}
+async function unloadInf(){
+  await fetch('/api/inference/unload',{method:'POST'});
+  S.infLoaded=false;S.infOn=false;S.infMeta=null;S.infBoxes=[];
+  document.getElementById('cbInf').checked=false;
+  document.getElementById('infToggleLbl').classList.add('hidden');
+  document.getElementById('infLabel').classList.add('hidden');
+  closeInfModal();redr();toast('Model unloaded');
+}
+function onInfToggle(){
+  S.infOn=document.getElementById('cbInf').checked;
+  if(S.infOn)requestInference(S.frame);else{S.infBoxes=[];redr();}
+}
+async function requestInference(n){
+  if(!S.infLoaded||S.infInFlight)return;
+  if(S.infFrame===n&&S.infBoxes.length)return;  // already cached this frame
+  S.infInFlight=true;
+  try{
+    var conf=parseFloat(document.getElementById('infConf').value)||0.25;
+    var r=await fetch('/api/inference/predict/'+n+'?conf='+conf);
+    var d=await r.json();
+    if(n!==S.frame){S.infInFlight=false;return;}  // user moved on
+    S.infBoxes=d.boxes||[];S.infFrame=n;redr();
+  }catch(e){/* silent */}
+  finally{S.infInFlight=false;}
+}
+
 async function doExp(t){toast('Exporting…');
   try{var r=await fetch('/api/export',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({type:t})});var d=await r.json();
@@ -3120,6 +3246,45 @@ class Handler(BaseHTTPRequestHandler):
             s = self.tracker.state
             labelled = sorted(set(s.masks.keys()) | set(s.bboxes.keys()))
             self._json({"frames": labelled, "objects": {str(k): v for k, v in s.objects.items()}})
+        elif p == "/api/inference/models":
+            if infer_mod is None:
+                self._json({"models": [], "error": "inference module not loaded"}); return
+            self._json({"models": infer_mod.scan_weights(),
+                        "loaded": infer_mod.get_meta(),
+                        "is_loaded": infer_mod.is_loaded()})
+        elif p == "/api/inference/current":
+            if infer_mod is None:
+                self._json({"is_loaded": False}); return
+            self._json({"is_loaded": infer_mod.is_loaded(),
+                        "loaded": infer_mod.get_meta()})
+        elif p.startswith("/api/inference/predict/"):
+            if infer_mod is None or not infer_mod.is_loaded():
+                self._json({"boxes": [], "error": "no model loaded"}); return
+            # /api/inference/predict/<sample_idx>?conf=0.25
+            try:
+                parts = p.split("/")
+                si = int(parts[-1])
+            except ValueError:
+                self.send_error(400); return
+            conf = 0.25
+            if "?" in self.path:
+                q = self.path.split("?", 1)[1]
+                for kv in q.split("&"):
+                    if kv.startswith("conf="):
+                        try: conf = float(kv.split("=", 1)[1])
+                        except ValueError: pass
+            frame_bgr = self.video.get_frame(si)
+            if frame_bgr is None:
+                self.send_error(404); return
+            try:
+                boxes = infer_mod.predict(frame_bgr, conf=conf)
+            except Exception as e:
+                self._json({"boxes": [], "error": f"{type(e).__name__}: {e}"}); return
+            self._json({"boxes": boxes,
+                        "frame": si,
+                        "img_w": int(frame_bgr.shape[1]),
+                        "img_h": int(frame_bgr.shape[0]),
+                        "conf": conf})
         else:
             self.send_error(404)
 
@@ -3251,6 +3416,21 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"ok": ok})
         elif p == "/api/reset":
             self.tracker.reset()
+            self._json({"ok": True})
+        elif p == "/api/inference/load":
+            if infer_mod is None:
+                self._json({"ok": False, "error": "inference module unavailable"}); return
+            d = json.loads(body)
+            try:
+                meta = infer_mod.load_backend(
+                    d["path"], kind=d.get("kind"), device=d.get("device"),
+                )
+                self._json({"ok": True, "meta": meta})
+            except Exception as e:
+                self._json({"ok": False, "error": f"{type(e).__name__}: {e}"}, 500)
+        elif p == "/api/inference/unload":
+            if infer_mod is not None:
+                infer_mod.unload_backend()
             self._json({"ok": True})
         elif p == "/api/switch_video":
             d = json.loads(body)

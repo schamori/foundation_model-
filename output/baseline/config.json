@@ -26,6 +26,8 @@
   "evaluators": [
     "similarity"
   ],
+  "use_wandb": true,
+  "wandb_project": "foundential-model",
   "debug": false,
   "vjepa_backbone": "vit_large_patch16_224",
   "predictor_depth": 6,

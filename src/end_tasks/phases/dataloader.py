@@ -42,29 +42,56 @@ def _video_id(name: str) -> str:
     return name[:idx] if idx > 0 else name
 
 
+_RS_TL = re.compile(r'^(rs|tl)[-_](\d+)', re.IGNORECASE)
+
+
+def _rs_tl_variants(name: str) -> list[str]:
+    """Return both RS-NNN and TL-NNN variants for a name (they are the same video).
+
+    e.g. RS-046 also tries TL-046, and vice versa.
+    """
+    m = _RS_TL.match(name)
+    if not m:
+        return [name]
+    num = m.group(2)
+    prefix = m.group(1).upper()
+    other = "TL" if prefix == "RS" else "RS"
+    sep = name[len(m.group(1))]  # preserve - or _
+    alt = other + sep + num + name[len(m.group(0)):]
+    return [name, alt]
+
+
 def _match_name_to_autosave(
     name: str,
     autosave_dirs: list[str],
 ) -> str | None:
     """Match a phase-label video name to an autosave directory name.
 
-    Tries: exact → video-id prefix match → contains.
+    Tries: exact → video-id prefix match (including RS/TL equivalence) → contains.
     """
+    candidates = _rs_tl_variants(name)
+
+    for cand in candidates:
+        cand_lower = cand.lower()
+        vid_id = _video_id(cand).lower()
+
+        # Exact match
+        for d in autosave_dirs:
+            if d.lower() == cand_lower:
+                return d
+
+        # Video-ID prefix match (5ALA_003 matches 5ALA_003_..., not 5ALA_006_...)
+        # Require a separator after vid_id so ATLR_3 does NOT match ATLR_31
+        for d in autosave_dirs:
+            dl = d.lower()
+            if dl == vid_id:
+                return d
+            for sep in ("_", "-"):
+                if dl.startswith(vid_id + sep):
+                    return d
+
+    # Substring match (last resort, use original name only)
     name_lower = name.lower()
-    vid_id = _video_id(name).lower()
-
-    # Exact match
-    for d in autosave_dirs:
-        if d.lower() == name_lower:
-            return d
-
-    # Video-ID prefix match (5ALA_003 matches 5ALA_003_..., not 5ALA_006_...)
-    for d in autosave_dirs:
-        dl = d.lower()
-        if dl == vid_id or dl.startswith(vid_id + "_") or dl.startswith(vid_id + "-"):
-            return d
-
-    # Substring match
     for d in autosave_dirs:
         if name_lower in d.lower():
             return d

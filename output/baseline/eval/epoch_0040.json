@@ -1,0 +1,21 @@
+{
+  "epoch": 40,
+  "checkpoint": "/home/moritz/Foundential Model/output/baseline/checkpoints/dino_epoch40.pt",
+  "metrics": {
+    "similarity": {
+      "epoch": 40,
+      "train_sws": 0.441512990193254,
+      "train_augmentation_stability": {
+        "hflip": 0.3522331140176538,
+        "color_jitter": 0.974391188621521,
+        "blur": 0.9974509014487266
+      },
+      "val_sws": 0.4523337803118686,
+      "val_augmentation_stability": {
+        "hflip": 0.2795397905914579,
+        "color_jitter": 0.9759914549589158,
+        "blur": 0.9966065472960471
+      }
+    }
+  }
+}

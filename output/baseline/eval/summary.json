@@ -78,5 +78,165 @@
         }
       }
     }
+  },
+  {
+    "epoch": 1,
+    "metrics": {
+      "similarity": {
+        "epoch": 1,
+        "train_sws": 0.45376660209112385,
+        "train_augmentation_stability": {
+          "hflip": 0.6304008883601637,
+          "color_jitter": 0.9857901720404623,
+          "blur": 0.997023113012314
+        },
+        "val_sws": 0.46463694345130624,
+        "val_augmentation_stability": {
+          "hflip": 0.6372754499679432,
+          "color_jitter": 0.9822489136159419,
+          "blur": 0.9957728804349898
+        }
+      }
+    }
+  },
+  {
+    "epoch": 10,
+    "metrics": {
+      "similarity": {
+        "epoch": 10,
+        "train_sws": 0.5256438321709199,
+        "train_augmentation_stability": {
+          "hflip": 0.6563075649715028,
+          "color_jitter": 0.989546881914139,
+          "blur": 0.9971329877376556
+        },
+        "val_sws": 0.5419953284452945,
+        "val_augmentation_stability": {
+          "hflip": 0.6690336135870312,
+          "color_jitter": 0.9908850004673004,
+          "blur": 0.9979182118177414
+        }
+      }
+    }
+  },
+  {
+    "epoch": 20,
+    "metrics": {
+      "similarity": {
+        "epoch": 20,
+        "train_sws": 0.5218464123517432,
+        "train_augmentation_stability": {
+          "hflip": 0.6422220754459268,
+          "color_jitter": 0.9893287210464479,
+          "blur": 0.998160840988159
+        },
+        "val_sws": 0.5434851699342222,
+        "val_augmentation_stability": {
+          "hflip": 0.5536911332521122,
+          "color_jitter": 0.988582000374794,
+          "blur": 0.997381267428398
+        }
+      }
+    }
+  },
+  {
+    "epoch": 30,
+    "metrics": {
+      "similarity": {
+        "epoch": 30,
+        "train_sws": 0.4585346087651839,
+        "train_augmentation_stability": {
+          "hflip": 0.5043451944611733,
+          "color_jitter": 0.985695511072874,
+          "blur": 0.9974413014650345
+        },
+        "val_sws": 0.46598098267748184,
+        "val_augmentation_stability": {
+          "hflip": 0.38941740207932896,
+          "color_jitter": 0.9848889563679696,
+          "blur": 0.9967188127040864
+        }
+      }
+    }
+  },
+  {
+    "epoch": 40,
+    "metrics": {
+      "similarity": {
+        "epoch": 40,
+        "train_sws": 0.441512990193254,
+        "train_augmentation_stability": {
+          "hflip": 0.3522331140176538,
+          "color_jitter": 0.974391188621521,
+          "blur": 0.9974509014487266
+        },
+        "val_sws": 0.4523337803118686,
+        "val_augmentation_stability": {
+          "hflip": 0.2795397905914579,
+          "color_jitter": 0.9759914549589158,
+          "blur": 0.9966065472960471
+        }
+      }
+    }
+  },
+  {
+    "epoch": 50,
+    "metrics": {
+      "similarity": {
+        "epoch": 50,
+        "train_sws": 0.46982499501594815,
+        "train_augmentation_stability": {
+          "hflip": 0.30485285149406993,
+          "color_jitter": 0.9701940069198609,
+          "blur": 0.9951588771343232
+        },
+        "val_sws": 0.4836979344029737,
+        "val_augmentation_stability": {
+          "hflip": 0.24065311700009626,
+          "color_jitter": 0.9742391683459282,
+          "blur": 0.9954194239377975
+        }
+      }
+    }
+  },
+  {
+    "epoch": 60,
+    "metrics": {
+      "similarity": {
+        "epoch": 60,
+        "train_sws": 0.49593168699133955,
+        "train_augmentation_stability": {
+          "hflip": 0.23924933366254852,
+          "color_jitter": 0.9672706521749497,
+          "blur": 0.9934876287579537
+        },
+        "val_sws": 0.5135268267785226,
+        "val_augmentation_stability": {
+          "hflip": 0.24375656254185013,
+          "color_jitter": 0.963791524887085,
+          "blur": 0.9933656904101372
+        }
+      }
+    }
+  },
+  {
+    "epoch": 70,
+    "metrics": {
+      "similarity": {
+        "epoch": 70,
+        "train_sws": 0.5242477451881389,
+        "train_augmentation_stability": {
+          "hflip": 0.2381028205160983,
+          "color_jitter": 0.9672270777821541,
+          "blur": 0.9915542571544647
+        },
+        "val_sws": 0.5349750498731677,
+        "val_augmentation_stability": {
+          "hflip": 0.2244016137426893,
+          "color_jitter": 0.9610664039850234,
+          "blur": 0.9938824233412743
+        }
+      }
+    }
   }
 ]

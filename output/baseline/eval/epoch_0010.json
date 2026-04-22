@@ -4,17 +4,17 @@
   "metrics": {
     "similarity": {
       "epoch": 10,
-      "train_sws": 0.5394934724328853,
+      "train_sws": 0.5256438321709199,
       "train_augmentation_stability": {
-        "hflip": 0.7452150186926594,
-        "color_jitter": 0.991055270910263,
-        "blur": 0.9980276960730553
+        "hflip": 0.6563075649715028,
+        "color_jitter": 0.989546881914139,
+        "blur": 0.9971329877376556
       },
-      "val_sws": 0.5644925724873273,
+      "val_sws": 0.5419953284452945,
       "val_augmentation_stability": {
-        "hflip": 0.6899129555616527,
-        "color_jitter": 0.9917743801474572,
-        "blur": 0.9983579456210135
+        "hflip": 0.6690336135870312,
+        "color_jitter": 0.9908850004673004,
+        "blur": 0.9979182118177414
       }
     }
   }

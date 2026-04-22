@@ -1,0 +1,48 @@
+{
+  "os": "Linux-6.8.0-106-generic-x86_64-with-glibc2.35",
+  "python": "CPython 3.10.19",
+  "startedAt": "2026-04-22T15:04:51.944770Z",
+  "args": [
+    "--all"
+  ],
+  "program": "-m src.end_tasks.train",
+  "git": {
+    "remote": "https://github.com/schamori/foundation_model-.git",
+    "commit": "d1997d9d6144389064cf2d9dba463891ec185e06"
+  },
+  "email": "21.5.2003.ms@gmail.com",
+  "root": "/home/moritz/Foundential Model",
+  "host": "morty",
+  "executable": "/home/moritz/miniconda3/envs/ucl/bin/python",
+  "cpu_count": 26,
+  "cpu_count_logical": 52,
+  "gpu": "NVIDIA GeForce RTX 4090",
+  "gpu_count": 2,
+  "disk": {
+    "/": {
+      "total": "1951180079104",
+      "used": "1664804536320"
+    }
+  },
+  "memory": {
+    "total": "269844537344"
+  },
+  "gpu_nvidia": [
+    {
+      "name": "NVIDIA GeForce RTX 4090",
+      "memoryTotal": "25757220864",
+      "cudaCores": 16384,
+      "architecture": "Ada",
+      "uuid": "GPU-e2700d23-eb11-f09a-d4cb-276e48b746bf"
+    },
+    {
+      "name": "NVIDIA GeForce RTX 4090",
+      "memoryTotal": "25757220864",
+      "cudaCores": 16384,
+      "architecture": "Ada",
+      "uuid": "GPU-d74c8782-4f77-2509-f613-917b254cd1be"
+    }
+  ],
+  "cudaVersion": "12.9",
+  "writerId": "g1fehexivypjcwjgyjnmy129d1qeu0cb"
+}
